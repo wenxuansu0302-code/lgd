@@ -1,0 +1,13 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {simulation,viewModel} from '../dist/model.mjs';
+test('进程和地址就绪但没有实际探测，不判定通路成功',()=>{const s=simulation();delete s.nodes.edge.probe;assert.equal(viewModel(s).pathOK,false);assert.notEqual(viewModel(s).tone,'good');});
+test('真实 ACK 与零业务数据只证明通路，不证明数据验收',()=>{const s=simulation();s.nodes.core.endpoints.transport.body.gateways.gateway_2.json_received=0;const v=viewModel(s);assert.equal(v.pathOK,true);assert.equal(v.businessOK,false);assert.equal(v.checks[2].result,'pending');});
+test('超过 22 秒的缓存不算实时成功',()=>{const s=simulation();Object.values(s.nodes).forEach(n=>n.observed_at-=30);assert.equal(viewModel(s).tone,'neutral');assert.equal(viewModel(s).servicesOK,false);});
+test('错误的虚拟地址不能通过节点就绪检查',()=>{const s=simulation();s.nodes.core.addresses.nebula1=['10.77.0.99/24'];assert.equal(viewModel(s).addressesOK,false);assert.equal(viewModel(s).tone,'warn');});
+test('缺少拨号服务不能当作三端全部正常',()=>{const s=simulation();delete s.nodes.edge.services['quectel-cm.service'];assert.equal(viewModel(s).servicesOK,false);});
+test('systemd active 但进程被暂停，不视为三端健康',()=>{const s=simulation();s.nodes.server.services['lgd-server-v8.service'].ProcessState='T';assert.equal(viewModel(s).servicesOK,false);assert.equal(viewModel(s).tone,'warn');});
+test('组禁用与网络断链区分',()=>{const disabled=viewModel(simulation('disabled'));assert.equal(disabled.pathOK,true);assert.equal(disabled.enabled,false);assert.equal(disabled.checks[1].result,'blocked');assert.equal(viewModel(simulation('outage')).tone,'bad');assert.equal(viewModel(simulation('outage')).telemetryFresh,false);});
+test('陈旧遥测不能被当前探测覆盖',()=>{const s=simulation();s.nodes.core.endpoints.telemetry.body.gateways[0].edge.age_ms=30000;const v=viewModel(s);assert.equal(v.pathOK,true);assert.equal(v.checks[4].result,'warn');});
+test('验收哈希或清理失败均不显示数据验收通过',()=>{const s=simulation();s.validation.results={passed:true,image_sha256_match:false,duplicate_ack:true};assert.equal(viewModel(s).businessOK,false);s.validation.results.image_sha256_match=true;s.validation.results.cleanup_errors=['core cleanup failed'];assert.equal(viewModel(s).businessOK,false);});
+test('离线恢复演示的队列逐步排空，不产生实际验收证据',()=>{const a=simulation('recovery',0),b=simulation('recovery',12);assert.equal(a.nodes.edge.critical_pending,48);assert.equal(b.nodes.edge.critical_pending,0);assert.equal(viewModel(b).businessOK,false);});
