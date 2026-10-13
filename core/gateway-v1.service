@@ -1,0 +1,15 @@
+[Unit]
+Description=LGD gateway_v1 startup service
+After=network.target quectel-cm.service
+Wants=quectel-cm.service
+
+[Service]
+Type=simple
+ExecStart=/root/start_gateway_v1.sh
+WorkingDirectory=/root
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

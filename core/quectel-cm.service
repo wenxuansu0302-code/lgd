@@ -1,0 +1,16 @@
+[Unit]
+Description=Quectel CM cellular connection
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/root/Net_Tools/quectel-CM
+WorkingDirectory=/root/Net_Tools
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

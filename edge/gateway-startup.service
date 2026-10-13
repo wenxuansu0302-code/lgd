@@ -1,0 +1,17 @@
+[Unit]
+Description=Configure ports, connect 5G, verify ping and start GW1
+After=local-fs.target network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /root/start_gateway_all.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
