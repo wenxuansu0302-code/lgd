@@ -1,22 +1,16 @@
 #!/bin/bash
 
-# One script owns the complete gateway lifecycle:
-# configure ports -> dial 5G -> wait for connected log -> ping -> start GW1.
+# Independent cellular dialler. Does not own the business process.
 set -u
 
-EDGE_DIR="/root/lgd"
-EDGE_SCRIPT="$EDGE_DIR/run_edge_GW1_v2.sh"
 QUECTEL_CM="/root/Net_Tools/quectel-CM"
 PING_TARGET="${PING_TARGET:-223.5.5.5}"
 CLOUD_HOST="${CLOUD_HOST:-47.99.47.169}"
-CLOUD_PORT="${CLOUD_PORT:-11500}"
+CLOUD_PORT="${CLOUD_PORT:-11590}"
 
 QUECTEL_LOG="/run/quectel-CM.log"
-EDGE_LOG="/var/log/gateway-app.log"
-EDGE_LOG_LIMIT=20971520
 
 QUECTEL_PID=""
-EDGE_PID=""
 STOPPING=0
 
 log() {
@@ -51,7 +45,6 @@ stop_process() {
 cleanup() {
     [ "$STOPPING" -eq 1 ] && return
     STOPPING=1
-    stop_process "$EDGE_PID" "GW1"
     stop_process "$QUECTEL_PID" "quectel-CM"
     log "All gateway processes stopped"
 }
@@ -59,23 +52,6 @@ cleanup() {
 trap 'cleanup; exit 0' INT TERM HUP QUIT
 trap cleanup EXIT
 
-configure_ports() {
-    log "Configuring network ports"
-
-    ip link set fm1-mac2 up
-    ip addr flush dev fm1-mac2
-    ip addr add 192.168.0.233/24 dev fm1-mac2
-
-    ip link set fm1-mac4 up
-    ip addr flush dev fm1-mac4
-    ip addr add 192.168.1.106/24 dev fm1-mac4
-
-    ip link set fm1-mac6 up
-    ip addr flush dev fm1-mac6
-    ip addr add 192.168.2.1/24 dev fm1-mac6
-
-    log "Network ports configured"
-}
 
 kill_old_quectel() {
     local pids
@@ -118,7 +94,6 @@ dial_5g_until_online() {
         kill_old_quectel
         : > "$QUECTEL_LOG"
 
-        # Required command: run quectel-CM persistently in the background.
         "$QUECTEL_CM" >> "$QUECTEL_LOG" 2>&1 &
         QUECTEL_PID=$!
         log "5G attempt=$attempt, quectel-CM started in background PID=$QUECTEL_PID"
@@ -138,7 +113,6 @@ dial_5g_until_online() {
                     else
                         log "WARN: 5G ready: usb0=$usb_ip; cloud probe unavailable, gateway will keep retrying"
                     fi
-                    tail -20 "$QUECTEL_LOG"
                     return 0
                 fi
             fi
@@ -163,47 +137,14 @@ dial_5g_until_online() {
     return 1
 }
 
-start_gateway_program() {
-    if [ ! -x "$EDGE_SCRIPT" ]; then
-        log "ERROR: $EDGE_SCRIPT is missing or not executable"
-        return 1
-    fi
 
-    : > "$EDGE_LOG"
-    cd "$EDGE_DIR" || return 1
-    "$EDGE_SCRIPT" >> "$EDGE_LOG" 2>&1 &
-    EDGE_PID=$!
-    log "GW1 started in background PID=$EDGE_PID"
-
-    sleep 3
-    if ! running "$EDGE_PID"; then
-        log "ERROR: GW1 exited during startup"
-        tail -50 "$EDGE_LOG"
-        return 1
-    fi
-}
-
-limit_gateway_log() {
-    local size=0
-    [ -f "$EDGE_LOG" ] || return 0
-    size="$(wc -c < "$EDGE_LOG" 2>/dev/null || echo 0)"
-    if [ "$size" -gt "$EDGE_LOG_LIMIT" ]; then
-        log "Gateway log reached $size bytes; truncating it"
-        : > "$EDGE_LOG"
-    fi
-}
 
 monitor_all() {
     local link_failures=0
 
     while [ "$STOPPING" -eq 0 ]; do
         sleep 15
-        limit_gateway_log
 
-        if ! running "$EDGE_PID"; then
-            log "ERROR: GW1 PID=$EDGE_PID exited"
-            return 1
-        fi
 
         if ! running "$QUECTEL_PID"; then
             log "quectel-CM PID=$QUECTEL_PID exited; redialing"
@@ -213,7 +154,7 @@ monitor_all() {
             continue
         fi
 
-        # A cloud/server timeout must never trigger a modem redial.  Redial only
+        # A cloud/server timeout must never trigger a modem redial. Redial only
         # when the local 5G interface actually loses its address or default route.
         if usb0_link_ready; then
             [ "$link_failures" -gt 0 ] && log "5G usb0 address and route recovered"
@@ -237,9 +178,7 @@ main() {
         return 1
     }
 
-    configure_ports || return 1
     dial_5g_until_online || return 1
-    start_gateway_program || return 1
     monitor_all
 }
 

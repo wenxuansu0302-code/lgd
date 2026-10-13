@@ -168,3 +168,11 @@ SATELLITE_HTTP_PORT = 10014
 STATUS_HTTP_PORT = 10015
 STATUS_MONITORED_PORTS = [11400, 11401, 11403]
 SATELLITE_RECONNECT_INTERVAL_SECONDS = 3.0
+
+# Only this VPN address accepts direct edge traffic; frontend/LAN stays unchanged.
+TUNNEL_ENABLED = True
+TUNNEL_LISTEN_HOST = "10.77.0.10"
+TUNNEL_LISTEN_PORT = 11500
+TUNNEL_PEERS = {"10.77.0.11":"gateway_1", "10.77.0.12":"gateway_2", "10.77.0.14":"gateway_4"}
+TUNNEL_INBOX_PATH = "/root/lgd/tunnel_inbox.db"
+CLEAR_SATELLITE_ON_START = False

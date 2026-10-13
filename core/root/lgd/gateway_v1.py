@@ -78,6 +78,400 @@ from urllib.parse import urlparse, parse_qs, urlsplit
 
 from config import *
 
+# BEGIN integrated transport v1.2 (generated from audited source)
+import collections
+
+import contextlib
+
+import hashlib
+
+import ipaddress
+
+import json
+
+import os
+
+import queue
+
+import re
+
+import socket
+
+import sqlite3
+
+import struct
+
+import subprocess
+
+import threading
+
+import time
+
+import uuid
+
+_lgdt_VERSION = '1.0'
+
+_lgdt_MAX_JSON = 1024 * 1024
+
+_lgdt_MAX_MEDIA = 20 * 1024 * 1024
+
+_lgdt_ID_FIELDS = ('gateway', 'gateway_id', 'gateway_name', 'source_gateway', 'edge_gateway', 'device_gateway')
+
+def _lgdt_canonical(value):
+    key = re.sub('[^a-z0-9]', '', str(value).lower())
+    for number in (1, 2, 3, 4, 5, 6):
+        if key in (str(number), 'gateway' + str(number), 'gw' + str(number), 'g' + str(number)):
+            return 'gateway_' + str(number)
+    return None
+
+def _lgdt_declared_gateway(payload):
+    values = [_lgdt_canonical(payload[field]) for field in _lgdt_ID_FIELDS if field in payload]
+    if not values or None in values or len(set(values)) != 1:
+        raise ValueError('missing, unknown or conflicting gateway identity')
+    return values[0]
+
+def _lgdt_json_bytes(payload):
+    return json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+def _lgdt_exact(conn, size):
+    parts = bytearray()
+    while len(parts) < size:
+        data = conn.recv(size - len(parts))
+        if not data:
+            raise ConnectionError('peer closed')
+        parts.extend(data)
+    return bytes(parts)
+
+def _lgdt_configure_socket(conn, timeout=10):
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for name, value in (('TCP_KEEPIDLE', 30), ('TCP_KEEPINTVL', 10), ('TCP_KEEPCNT', 3)):
+        option = getattr(socket, name, None)
+        if option is not None:
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, option, value)
+            except OSError:
+                pass
+    conn.settimeout(timeout)
+
+class _lgdt_Database:
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.lock = threading.RLock()
+
+    @contextlib.contextmanager
+    def connect(self):
+        conn = sqlite3.connect(self.path, timeout=10)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute('PRAGMA busy_timeout=10000')
+            conn.execute('PRAGMA synchronous=FULL')
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+def _lgdt_classify_nebula_tunnel(data):
+    remote = data.get('currentRemote')
+    relays = data.get('currentRelaysToMe') or []
+    valid_remote = isinstance(remote, str) and ':' in remote and (remote not in ('0.0.0.0:0', '[::]:0', 'invalid AddrPort'))
+    if valid_remote and (not relays):
+        mode = 'direct'
+    elif not valid_remote and relays:
+        mode = 'relay'
+    else:
+        mode = 'unknown'
+    carrier = 'unknown'
+    if valid_remote:
+        try:
+            address = ipaddress.ip_address(remote.rsplit(':', 1)[0].strip('[]'))
+            carrier = 'openvpn_tcp' if address.version == 4 and address in ipaddress.ip_network('10.78.0.0/24') else 'public_udp'
+        except ValueError:
+            pass
+    return {'overlay_mode': mode, 'nebula_peer_mode': mode, 'underlay_carrier': carrier, 'physical_route': 'tcp_hub' if carrier == 'openvpn_tcp' else 'udp_peer' if carrier == 'public_udp' else 'unknown', 'underlay_remote': remote, 'relay_candidates': relays, 'diagnostic_at': time.time()}
+
+class _lgdt_NebulaMonitor:
+
+    def __init__(self, peers):
+        self.peers = list(peers)
+        self.values = {}
+        self.lock = threading.Lock()
+        self.closed = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True, name='nebula-status').start()
+
+    def snapshot(self, peer):
+        with self.lock:
+            return dict(self.values.get(peer, {'overlay_mode': 'unknown'}))
+
+    def run(self):
+        while not self.closed.is_set():
+            for peer in self.peers:
+                value = {'overlay_mode': 'unknown'}
+                if os.path.isfile('/etc/nebula/debug-client'):
+                    try:
+                        result = subprocess.run(['ssh', '-p', '11992', '-i', '/etc/nebula/debug-client', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=2', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/etc/nebula/debug_known_hosts', 'lgd-diag@127.0.0.1', 'print-tunnel ' + peer], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=3)
+                        if result.returncode == 0:
+                            value = _lgdt_classify_nebula_tunnel(json.loads(result.stdout))
+                    except (OSError, ValueError, subprocess.TimeoutExpired):
+                        pass
+                with self.lock:
+                    self.values[peer] = value
+            self.closed.wait(10)
+
+class _lgdt_Inbox(_lgdt_Database):
+
+    def __init__(self, path, retention_days=7, max_records=20000):
+        super().__init__(path)
+        self.retention_days, self.max_records = (retention_days, max_records)
+        with self.connect() as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('CREATE TABLE IF NOT EXISTS inbox (gateway TEXT, delivery_id TEXT, body TEXT NOT NULL, digest TEXT NOT NULL, created REAL NOT NULL, published INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(gateway,delivery_id))')
+            db.execute('CREATE INDEX IF NOT EXISTS inbox_expiry ON inbox(published,created)')
+            db.execute('CREATE TABLE IF NOT EXISTS policy (gateway TEXT PRIMARY KEY, enabled INTEGER NOT NULL)')
+
+    def accept(self, gateway, delivery_id, payload, publish):
+        body = _lgdt_json_bytes(payload).decode('utf-8')
+        digest = hashlib.sha256(body.encode('utf-8')).hexdigest()
+        with self.lock:
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                row = db.execute('SELECT digest,published FROM inbox WHERE gateway=? AND delivery_id=?', (gateway, delivery_id)).fetchone()
+                if row:
+                    if row['digest'] != digest:
+                        raise ValueError('delivery ID reused with different content')
+                    if row['published']:
+                        return 'duplicate'
+                else:
+                    db.execute('DELETE FROM inbox WHERE published=1 AND created<?', (time.time() - self.retention_days * 86400,))
+                    excess = db.execute('SELECT count(*) FROM inbox').fetchone()[0] - self.max_records + 1
+                    if excess > 0:
+                        db.execute('DELETE FROM inbox WHERE rowid IN (SELECT rowid FROM inbox WHERE published=1 ORDER BY created,rowid LIMIT ?)', (excess,))
+                        if db.execute('SELECT count(*) FROM inbox').fetchone()[0] >= self.max_records:
+                            raise RuntimeError('core inbox full of unpublished records; delivery not acknowledged')
+                    db.execute('INSERT INTO inbox VALUES (?,?,?,?,?,0)', (gateway, delivery_id, body, digest, time.time()))
+            publish(gateway, payload)
+            with self.connect() as db:
+                db.execute('UPDATE inbox SET published=1 WHERE gateway=? AND delivery_id=?', (gateway, delivery_id))
+            return 'accepted'
+
+    def restore(self, publish):
+        with self.lock, self.connect() as db:
+            rows = db.execute('SELECT a.* FROM inbox a WHERE a.published=1 AND a.rowid=(SELECT b.rowid FROM inbox b WHERE b.gateway=a.gateway AND b.published=1 ORDER BY b.created DESC,b.rowid DESC LIMIT 1)').fetchall()
+        for row in rows:
+            publish(row['gateway'], json.loads(row['body']))
+
+    def set_enabled(self, gateway, enabled):
+        with self.lock, self.connect() as db:
+            value = int(bool(enabled))
+            row = db.execute('SELECT enabled FROM policy WHERE gateway=?', (gateway,)).fetchone()
+            if row is None or row['enabled'] != value:
+                db.execute('INSERT OR REPLACE INTO policy VALUES (?,?)', (gateway, value))
+
+    def enabled(self, gateway):
+        with self.lock, self.connect() as db:
+            row = db.execute('SELECT enabled FROM policy WHERE gateway=?', (gateway,)).fetchone()
+            return bool(row['enabled']) if row else True
+
+class _lgdt_CoreIngress:
+
+    def __init__(self, host, port, peers, inbox, publish_json, publish_media, log=print):
+        self.host, self.port, self.peers = (host, int(port), dict(peers))
+        self.inbox, self.publish_json, self.publish_media, self.log = (inbox, publish_json, publish_media, log)
+        self.lock = threading.RLock()
+        self.clients = threading.BoundedSemaphore(32)
+        self.closed = threading.Event()
+        self.stats = {}
+        self.sock = None
+        self.ready = threading.Event()
+        self.listener_state = 'starting'
+        self.listener_error = None
+        self.active = set()
+        self.sequence = collections.Counter()
+        self.monitor = _lgdt_NebulaMonitor(self.peers)
+
+    def snapshot(self, gateway=None):
+        with self.lock:
+            values = {name: dict(value, enabled=self.inbox.enabled(name)) for name, value in self.stats.items()}
+        for ip, name in self.peers.items():
+            value = values.setdefault(name, {'enabled': self.inbox.enabled(name), 'json_received': 0, 'media_received': 0})
+            value.update(self.monitor.snapshot(ip))
+            value['virtual_peer'] = ip
+        if gateway:
+            return values.get(_lgdt_canonical(gateway), {'enabled': self.inbox.enabled(_lgdt_canonical(gateway)), 'json_received': 0, 'media_received': 0})
+        return {'vpn_backend': 'nebula', 'security_mode': 'strict_e2e', 'listen': '{}:{}'.format(self.host, self.port), 'gateways': values, 'overlay_mode': 'unknown', 'listener_state': self.listener_state, 'listener_error': self.listener_error}
+
+    def set_group(self, group, enabled):
+        names = {1: 'gateway_1', 2: 'gateway_2', 3: 'gateway_4'}
+        if group in names:
+            self.inbox.set_enabled(names[group], enabled)
+
+    def start(self):
+        self.thread = threading.Thread(target=self.run, daemon=True, name='core-tunnel-ingress')
+        self.thread.start()
+        self.monitor.start()
+
+    def stop(self):
+        self.closed.set()
+        self.monitor.closed.set()
+        if self.sock:
+            self.sock.close()
+        with self.lock:
+            connections = list(self.active)
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            conn.close()
+        if hasattr(self, 'thread'):
+            self.thread.join(timeout=3)
+
+    def run(self):
+        restored = False
+        delay = 1
+        while not self.closed.is_set():
+            try:
+                if not restored:
+                    self.inbox.restore(self.publish_json)
+                    restored = True
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.sock.bind((self.host, self.port))
+                self.sock.listen(32)
+                self.sock.settimeout(1)
+                self.listener_state = 'listening'
+                self.listener_error = None
+                self.ready.set()
+                delay = 1
+                self.log('[TUNNEL] core ingress listening {}:{}'.format(self.host, self.port))
+                while not self.closed.is_set():
+                    try:
+                        conn, addr = self.sock.accept()
+                    except socket.timeout:
+                        continue
+                    gateway = self.peers.get(addr[0])
+                    if gateway is None or not self.clients.acquire(False):
+                        conn.close()
+                        continue
+                    with self.lock:
+                        self.active.add(conn)
+                    threading.Thread(target=self.handle, args=(conn, addr, gateway), daemon=True).start()
+            except Exception as exc:
+                if not self.closed.is_set():
+                    self.listener_state = 'retrying'
+                    self.listener_error = str(exc)
+                    self.log('[TUNNEL] ingress retry in {}s: {}'.format(delay, exc))
+            finally:
+                self.ready.clear()
+                if self.sock:
+                    self.sock.close()
+            self.closed.wait(delay)
+            delay = min(delay * 2, 10)
+        self.listener_state = 'stopped'
+
+    def count(self, gateway, kind):
+        with self.lock:
+            value = self.stats.setdefault(gateway, {'json_received': 0, 'media_received': 0, 'duplicates': 0, 'probes': 0})
+            value[kind] += 1
+            value['last_' + kind] = time.time()
+
+    def handle(self, conn, addr, gateway):
+        try:
+            with conn:
+                _lgdt_configure_socket(conn, 30)
+                first = _lgdt_exact(conn, 1)
+                if first == b'S':
+                    size = _lgdt_exact(conn, 1)[0]
+                    if size == 0:
+                        raise ValueError('empty media registration')
+                    declared = _lgdt_canonical(_lgdt_exact(conn, size).decode('utf-8'))
+                    if declared != gateway:
+                        raise ValueError('media identity differs from VPN peer')
+                    self.media(conn, gateway)
+                elif first in b'{ \t\r\n':
+                    self.json(conn, gateway, first)
+                else:
+                    raise ValueError('media registration or JSON required')
+        except (OSError, ValueError, ConnectionError, RuntimeError, sqlite3.Error) as exc:
+            self.log('[TUNNEL] {} {}: {}'.format(gateway, addr, exc))
+        finally:
+            with self.lock:
+                self.active.discard(conn)
+            self.clients.release()
+
+    def json(self, conn, gateway, prefix):
+        buffer = bytearray(prefix)
+        while True:
+            while b'\n' in buffer:
+                raw, unused = bytes(buffer).split(b'\n', 1)
+                buffer = bytearray(unused)
+                if len(raw) > _lgdt_MAX_JSON:
+                    raise ValueError('JSON line too large')
+                if not raw.strip():
+                    continue
+                payload = json.loads(raw.decode('utf-8'))
+                if not isinstance(payload, dict) or _lgdt_declared_gateway(payload) != gateway:
+                    raise ValueError('JSON identity differs from VPN peer')
+                if payload.get('type') == 'transport_probe':
+                    self.count(gateway, 'probes')
+                    reply = {'type': 'transport_probe_ack', 'version': _lgdt_VERSION, 'nonce': payload.get('nonce'), 'enabled': self.inbox.enabled(gateway), 'core_ready': True}
+                    conn.sendall(_lgdt_json_bytes(reply) + b'\n')
+                    return
+                metadata = payload.pop('_transport', None)
+                if not isinstance(metadata, dict) or metadata.get('version') != _lgdt_VERSION:
+                    raise ValueError('missing transport metadata')
+                delivery_id = metadata.get('delivery_id')
+                if not isinstance(delivery_id, str) or not re.match('^[a-zA-Z0-9_-]{1,96}$', delivery_id):
+                    raise ValueError('invalid delivery ID')
+                if not self.inbox.enabled(gateway):
+                    conn.sendall(_lgdt_json_bytes({'type': 'transport_ack', 'delivery_id': delivery_id, 'status': 'rejected', 'reason': 'disabled'}) + b'\n')
+                    continue
+                status = self.inbox.accept(gateway, delivery_id, payload, self.publish_json)
+                self.count(gateway, 'duplicates' if status == 'duplicate' else 'json_received')
+                conn.sendall(_lgdt_json_bytes({'type': 'transport_ack', 'delivery_id': delivery_id, 'status': status}) + b'\n')
+            if len(buffer) > _lgdt_MAX_JSON:
+                raise ValueError('JSON buffer too large')
+            data = conn.recv(65536)
+            if not data:
+                return
+            buffer.extend(data)
+
+    def media(self, conn, gateway):
+        while True:
+            kind, length = struct.unpack('!4sQ', _lgdt_exact(conn, 12))
+            if kind not in (b'VID0', b'SNAP') or length < 4 or length > _lgdt_MAX_MEDIA:
+                raise ValueError('invalid media frame')
+            body = _lgdt_exact(conn, length)
+            size = struct.unpack('!I', body[:4])[0]
+            if size > 1024 * 1024 or 4 + size > length:
+                raise ValueError('invalid metadata size')
+            metadata = json.loads(body[4:4 + size].decode('utf-8')) if size else {}
+            if not isinstance(metadata, dict):
+                raise ValueError('metadata must be an object')
+            if any((field in metadata for field in _lgdt_ID_FIELDS)) and _lgdt_declared_gateway(metadata) != gateway:
+                raise ValueError('media metadata identity differs from VPN peer')
+            jpeg = body[4 + size:]
+            if not jpeg.startswith(b'\xff\xd8') or not jpeg.endswith(b'\xff\xd9'):
+                raise ValueError('invalid JPEG')
+            if not self.inbox.enabled(gateway):
+                continue
+            with self.lock:
+                self.sequence[gateway] += 1
+                seq = self.sequence[gateway]
+            self.publish_media(gateway, kind.decode(), metadata, jpeg, seq)
+            self.count(gateway, 'media_received')
+CoreIngress = _lgdt_CoreIngress
+Inbox = _lgdt_Inbox
+canonical = _lgdt_canonical
+# END integrated transport
+
+
+_TUNNEL_INGRESS = None
+
 
 # Configuration values are maintained in config.py.
 
@@ -885,7 +1279,7 @@ def server_framed_pull_loop(server_host, server_port, video_hub, snapshot_store_
                             ))
                         continue
 
-                    video_hub.update(jpeg, metadata, gateway_id, frame_seq)
+                    publish_media_to_hubs(server_port, gateway_id, packet_type, metadata, jpeg, frame_seq, video_hub, snapshot_store_map)
 
                     if recv_video % LOG_EVERY_VIDEO == 0:
                         log(
@@ -912,14 +1306,7 @@ def server_framed_pull_loop(server_host, server_port, video_hub, snapshot_store_
                             ))
                         continue
 
-                    snapshot_store.update(
-                        jpeg=jpeg,
-                        metadata=metadata,
-                        gateway_id=gateway_id,
-                        channel=ch,
-                        source_port=server_port,
-                        server_seq=frame_seq,
-                    )
+                    publish_media_to_hubs(server_port, gateway_id, packet_type, metadata, jpeg, frame_seq, video_hub, snapshot_store_map)
 
                     log(
                         "[UPSTREAM][{}][SNAP] recv={} | gateway={} | seq={} | "
@@ -960,6 +1347,25 @@ def server_framed_pull_loop(server_host, server_port, video_hub, snapshot_store_
 
             log("[UPSTREAM][{}] reconnect after {:.1f}s".format(ch, RECONNECT_INTERVAL))
             time.sleep(RECONNECT_INTERVAL)
+
+
+def publish_json_to_hub(hub, text, obj):
+    # Both direct ingress and server pull publish through the existing JsonHub.
+    hub.update(text, obj)
+
+
+def publish_media_to_hubs(server_port, gateway_id, kind, metadata, jpeg, seq, video_hub, snapshot_map):
+    if not jpeg or not is_jpeg(jpeg):
+        raise ValueError("invalid JPEG")
+    if kind == "VID0":
+        if video_hub is not None:
+            video_hub.update(jpeg, metadata, gateway_id, seq)
+    elif kind == "SNAP":
+        store = snapshot_map.get(SNAP_FORWARD_MAP.get(server_port))
+        if store is not None:
+            store.update(jpeg=jpeg, metadata=metadata, gateway_id=gateway_id,
+                         channel=CHANNEL_NAME.get(server_port, str(server_port)),
+                         source_port=server_port, server_seq=seq)
 
 
 # ======================== JSON upstream pull (non-satellite) ========================
@@ -1029,7 +1435,7 @@ def server_json_pull_loop(server_host, server_port, json_hub):
                 last_json_bytes = len(text.encode("utf-8"))
                 last_json_time = time.time()
 
-                json_hub.update(text, obj)
+                publish_json_to_hub(json_hub, text, obj)
 
                 # 11410 已移出此循环，故删除原来的特殊日志
 
@@ -2460,6 +2866,8 @@ class HeartbeatStatus:
         if gateway_id not in (1, 2, 3):
             return False
         payload = payload if isinstance(payload, dict) else {}
+        if _TUNNEL_INGRESS is not None and "group_enabled" in payload:
+            _TUNNEL_INGRESS.set_group(gateway_id, self._as_bool(payload["group_enabled"]))
         if "edge_online" in payload:
             edge_online = self._as_bool(payload.get("edge_online"))
         elif "status" in payload:
@@ -2740,6 +3148,7 @@ class SliceMetricsRegistry:
                     },
                 },
                 "slices": slices,
+                "transport": (_TUNNEL_INGRESS.snapshot(source_gateway) if _TUNNEL_INGRESS else {"enabled": False}),
             })
 
         return {
@@ -2824,7 +3233,9 @@ class StatusHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split('?')[0]
-        if path == '/link1' or path == '/link2' or path == '/link3':
+        if path == '/transport':
+            self.send_json(200, _TUNNEL_INGRESS.snapshot() if _TUNNEL_INGRESS else {"enabled": False})
+        elif path == '/link1' or path == '/link2' or path == '/link3':
             idx = int(path[-1]) - 1
             gateway_id = idx + 1
             if self.heartbeat_status is not None and 1 <= gateway_id <= 3:
@@ -2856,6 +3267,7 @@ def make_status_handler(hubs, heartbeat_status=None):
 # ======================== Main ========================
 
 def main():
+    global _TUNNEL_INGRESS
     parser = argparse.ArgumentParser(
         description="Core Gateway: framed + JSON router from server.py to frontend HTTP services"
     )
@@ -2966,6 +3378,32 @@ def main():
             source_port=server_port,
             file_path=JSON_FILE_ROUTE_MAP.get(server_port),
         )
+
+    if TUNNEL_ENABLED:
+        json_routes = {"gateway_1":11406,"gateway_2":11407,"gateway_4":11408,"gateway_5":11409}
+        frame_routes = {"gateway_{}".format(i):11400+i-1 for i in range(1,7)}
+        direct_fps = {}
+        def direct_json(gateway, payload):
+            port = json_routes.get(gateway)
+            if port not in json_hubs:
+                raise ValueError("no JSON output for " + gateway)
+            publish_json_to_hub(json_hubs[port], json.dumps(payload,ensure_ascii=False,separators=(",",":")), payload)
+        def direct_media(gateway, kind, metadata, jpeg, seq):
+            port = frame_routes[gateway]
+            hub = video_hubs.get(port)
+            publish_media_to_hubs(port,gateway,kind,metadata,jpeg,seq,hub,snapshot_store_map)
+            if kind == "VID0" and hub is not None:
+                now = time.monotonic()
+                last,count = direct_fps.get(gateway,(now,0))
+                count += 1
+                if now-last >= FPS_REPORT_INTERVAL:
+                    hub.avg_fps = count/(now-last)
+                    direct_fps[gateway] = (now,0)
+                else:
+                    direct_fps[gateway] = (last,count)
+        _TUNNEL_INGRESS = CoreIngress(TUNNEL_LISTEN_HOST,TUNNEL_LISTEN_PORT,TUNNEL_PEERS,
+                                      Inbox(TUNNEL_INBOX_PATH),direct_json,direct_media,log=log)
+        _TUNNEL_INGRESS.start()
 
     # ----- 启动前端 HTTP 服务（视频、快照、非卫星JSON） -----
     for server_port, frontend_port in VIDEO_FORWARD_MAP.items():
@@ -3085,9 +3523,12 @@ def main():
     # 启动时清空卫星消息表
     conn = satellite_db.connect()
     try:
-        conn.execute("DELETE FROM gateway_messages")
-        conn.commit()
-        log("[MAIN] Cleared satellite messages table (gateway_messages)")
+        if CLEAR_SATELLITE_ON_START:
+            conn.execute("DELETE FROM gateway_messages")
+            conn.commit()
+            log("[MAIN] Cleared satellite messages table (gateway_messages)")
+        else:
+            log("[MAIN] Preserved satellite messages on startup")
     except Exception as e:
         log("[MAIN] WARNING: Failed to clear satellite messages table: %s" % e)
     finally:

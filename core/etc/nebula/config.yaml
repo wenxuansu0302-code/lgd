@@ -1,0 +1,60 @@
+# LGD deployment 2026-10-13; Nebula 1.11.2
+# Nebula v1.11.2; use each node's own host.crt and host.key.
+pki:
+  ca: /etc/nebula/ca.crt
+  cert: /etc/nebula/host.crt
+  key: /etc/nebula/host.key
+  disconnect_invalid: true
+static_host_map:
+  "10.77.0.1": ["10.78.0.1:11990", "47.99.47.169:11990"]
+lighthouse:
+  am_lighthouse: false
+  interval: 10
+  hosts: ["10.77.0.1"]
+listen:
+  host: 0.0.0.0
+  port: 0
+punchy:
+  punch: true
+  respond: true
+relay:
+  am_relay: false
+  use_relays: true
+  relays: ["10.77.0.1"]
+cipher: chachapoly
+tun:
+  disabled: false
+  dev: nebula1
+  mtu: 1300
+  drop_local_broadcast: true
+  drop_multicast: true
+logging:
+  level: info
+  format: json
+sshd:
+  enabled: true
+  listen: 127.0.0.1:11992
+  host_key: /etc/nebula/debug-host
+  authorized_users:
+    - user: lgd-diag
+      keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILxJ/WhM83IxxX9tslPOhSYk6KXS/H37rOAp34kFFX9n root@localhost"]
+firewall:
+  outbound_action: drop
+  inbound_action: drop
+  conntrack:
+    tcp_timeout: 12m
+    udp_timeout: 3m
+    default_timeout: 10m
+  outbound:
+    - {port: 11400-11410, proto: tcp, host: lgd-server}
+    - {port: 11416, proto: tcp, host: lgd-server}
+    - {port: 11420, proto: tcp, host: lgd-server}
+    - {port: 11501, proto: tcp, host: lgd-server}
+    - {port: 11502, proto: tcp, host: lgd-server}
+    - {port: any, proto: icmp, host: lgd-server}
+    - {port: any, proto: icmp, group: edge}
+  inbound:
+    - {port: 11500, proto: tcp, group: edge}
+    - {port: 10000-10017, proto: tcp, group: ops}
+    - {port: any, proto: icmp, group: edge}
+    - {port: any, proto: icmp, host: lgd-server}

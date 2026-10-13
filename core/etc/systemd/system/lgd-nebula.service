@@ -1,0 +1,17 @@
+[Unit]
+Wants=lgd-tcp-carrier.service
+After=lgd-tcp-carrier.service
+PartOf=lgd.target
+Description=LGD Nebula 5G encrypted overlay
+Wants=network.target
+After=network.target
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/nebula -test -config /etc/nebula/config.yaml
+ExecStart=/usr/local/bin/nebula -config /etc/nebula/config.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+UMask=0077
+[Install]
+WantedBy=multi-user.target

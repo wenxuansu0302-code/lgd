@@ -106,6 +106,354 @@ from datetime import datetime, timezone, timedelta
 
 from edge_config import *
 
+# BEGIN integrated transport v1.2 (generated from audited source)
+import collections
+
+import contextlib
+
+import hashlib
+
+import ipaddress
+
+import json
+
+import os
+
+import queue
+
+import re
+
+import socket
+
+import sqlite3
+
+import struct
+
+import subprocess
+
+import threading
+
+import time
+
+import uuid
+
+_lgdt_VERSION = '1.0'
+
+_lgdt_MAX_JSON = 1024 * 1024
+
+_lgdt_ID_FIELDS = ('gateway', 'gateway_id', 'gateway_name', 'source_gateway', 'edge_gateway', 'device_gateway')
+
+def _lgdt_canonical(value):
+    key = re.sub('[^a-z0-9]', '', str(value).lower())
+    for number in (1, 2, 3, 4, 5, 6):
+        if key in (str(number), 'gateway' + str(number), 'gw' + str(number), 'g' + str(number)):
+            return 'gateway_' + str(number)
+    return None
+
+def _lgdt_declared_gateway(payload):
+    values = [_lgdt_canonical(payload[field]) for field in _lgdt_ID_FIELDS if field in payload]
+    if not values or None in values or len(set(values)) != 1:
+        raise ValueError('missing, unknown or conflicting gateway identity')
+    return values[0]
+
+def _lgdt_json_bytes(payload):
+    return json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+def _lgdt_read_line(conn, limit=_lgdt_MAX_JSON):
+    parts = bytearray()
+    while len(parts) <= limit:
+        byte = conn.recv(1)
+        if not byte:
+            raise ConnectionError('peer closed before response')
+        if byte == b'\n':
+            return json.loads(parts.decode('utf-8'))
+        parts.extend(byte)
+    raise ValueError('response too large')
+
+def _lgdt_configure_socket(conn, timeout=10):
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for name, value in (('TCP_KEEPIDLE', 30), ('TCP_KEEPINTVL', 10), ('TCP_KEEPCNT', 3)):
+        option = getattr(socket, name, None)
+        if option is not None:
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, option, value)
+            except OSError:
+                pass
+    conn.settimeout(timeout)
+
+class _lgdt_Database:
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.lock = threading.RLock()
+
+    @contextlib.contextmanager
+    def connect(self):
+        conn = sqlite3.connect(self.path, timeout=10)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute('PRAGMA busy_timeout=10000')
+            conn.execute('PRAGMA synchronous=FULL')
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+class _lgdt_Outbox(_lgdt_Database):
+
+    def __init__(self, path, max_pending=5000):
+        super().__init__(path)
+        self.max_pending = max_pending
+        with self.connect() as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('CREATE TABLE IF NOT EXISTS outbox (delivery_id TEXT PRIMARY KEY, wire TEXT NOT NULL, slice_id TEXT NOT NULL, created REAL NOT NULL)')
+
+    def add(self, item, gateway):
+        payload = json.loads(item['json_data'])
+        if _lgdt_declared_gateway(payload) != _lgdt_canonical(gateway):
+            raise ValueError('local JSON gateway differs from node identity')
+        delivery_id = uuid.uuid4().hex
+        payload['_transport'] = {'version': _lgdt_VERSION, 'delivery_id': delivery_id, 'critical': True}
+        item = dict(item, json_data=_lgdt_json_bytes(payload).decode('utf-8'), delivery_id=delivery_id)
+        with self.lock, self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT count(*) FROM outbox').fetchone()[0] >= self.max_pending:
+                raise RuntimeError('critical outbox full; refusing silent drop')
+            db.execute('INSERT INTO outbox VALUES (?,?,?,?)', (delivery_id, item['json_data'], item.get('slice_id', 'urllc'), time.time()))
+        return item
+
+    def next(self):
+        with self.lock, self.connect() as db:
+            row = db.execute('SELECT * FROM outbox ORDER BY created, rowid LIMIT 1').fetchone()
+            return dict(row) if row else None
+
+    def ack(self, delivery_id):
+        with self.lock, self.connect() as db:
+            db.execute('DELETE FROM outbox WHERE delivery_id=?', (delivery_id,))
+
+    def contains(self, delivery_id):
+        with self.lock, self.connect() as db:
+            return db.execute('SELECT 1 FROM outbox WHERE delivery_id=?', (delivery_id,)).fetchone() is not None
+
+    def count(self):
+        with self.lock, self.connect() as db:
+            return db.execute('SELECT count(*) FROM outbox').fetchone()[0]
+
+class _lgdt_DurableQueue:
+    """Keep critical messages before admission to the original dropping queue."""
+
+    def __init__(self, original, outbox, gateway):
+        self.original, self.outbox, self.gateway = (original, outbox, gateway)
+        self.maxsize = original.maxsize
+
+    def put(self, item):
+        if isinstance(item, dict) and item.get('slice_id') == 'urllc':
+            item = self.outbox.add(item, self.gateway)
+        return self.original.put(item)
+
+    def get(self, timeout=None):
+        return self.original.get(timeout)
+
+    def stats(self):
+        return self.original.stats()
+
+    def qsize(self):
+        return self.original.qsize()
+
+    def qsize_by(self, predicate):
+        return self.original.qsize_by(predicate)
+
+def _lgdt_classify_nebula_tunnel(data):
+    remote = data.get('currentRemote')
+    relays = data.get('currentRelaysToMe') or []
+    valid_remote = isinstance(remote, str) and ':' in remote and (remote not in ('0.0.0.0:0', '[::]:0', 'invalid AddrPort'))
+    if valid_remote and (not relays):
+        mode = 'direct'
+    elif not valid_remote and relays:
+        mode = 'relay'
+    else:
+        mode = 'unknown'
+    carrier = 'unknown'
+    if valid_remote:
+        try:
+            address = ipaddress.ip_address(remote.rsplit(':', 1)[0].strip('[]'))
+            carrier = 'openvpn_tcp' if address.version == 4 and address in ipaddress.ip_network('10.78.0.0/24') else 'public_udp'
+        except ValueError:
+            pass
+    return {'overlay_mode': mode, 'nebula_peer_mode': mode, 'underlay_carrier': carrier, 'physical_route': 'tcp_hub' if carrier == 'openvpn_tcp' else 'udp_peer' if carrier == 'public_udp' else 'unknown', 'underlay_remote': remote, 'relay_candidates': relays, 'diagnostic_at': time.time()}
+
+class _lgdt_NebulaMonitor:
+
+    def __init__(self, peers):
+        self.peers = list(peers)
+        self.values = {}
+        self.lock = threading.Lock()
+        self.closed = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True, name='nebula-status').start()
+
+    def snapshot(self, peer):
+        with self.lock:
+            return dict(self.values.get(peer, {'overlay_mode': 'unknown'}))
+
+    def run(self):
+        while not self.closed.is_set():
+            for peer in self.peers:
+                value = {'overlay_mode': 'unknown'}
+                if os.path.isfile('/etc/nebula/debug-client'):
+                    try:
+                        result = subprocess.run(['ssh', '-p', '11992', '-i', '/etc/nebula/debug-client', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=2', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/etc/nebula/debug_known_hosts', 'lgd-diag@127.0.0.1', 'print-tunnel ' + peer], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=3)
+                        if result.returncode == 0:
+                            value = _lgdt_classify_nebula_tunnel(json.loads(result.stdout))
+                    except (OSError, ValueError, subprocess.TimeoutExpired):
+                        pass
+                with self.lock:
+                    self.values[peer] = value
+            self.closed.wait(10)
+
+class _lgdt_PathManager:
+
+    def __init__(self, gateway, host, port, log=print, interval=2):
+        self.gateway, self.host, self.port = (_lgdt_canonical(gateway), host, int(port))
+        if self.gateway is None:
+            raise ValueError('unknown tunnel gateway')
+        self.log, self.interval = (log, interval)
+        self.lock = threading.Lock()
+        self.state = {'vpn_backend': 'nebula', 'security_mode': 'strict_e2e', 'virtual_peer': host, 'application_target': '{}:{}'.format(host, port), 'overlay_mode': 'unknown', 'core_probe': 'starting', 'allowed': False, 'route_reason': 'not yet probed', 'last_change': time.time(), 'failures': 0, 'rtt_ms': None}
+        self.closed = threading.Event()
+        self.monitor = _lgdt_NebulaMonitor([host])
+
+    def start(self):
+        self.monitor.start()
+        threading.Thread(target=self.run, daemon=True, name='tunnel-probe').start()
+
+    def snapshot(self):
+        with self.lock:
+            value = dict(self.state)
+        value.update(self.monitor.snapshot(self.host))
+        return value
+
+    def allowed(self):
+        return self.snapshot()['allowed']
+
+    def require(self):
+        if not self.allowed():
+            raise ConnectionError('core tunnel unavailable or gateway disabled')
+
+    def record_failure(self, error):
+        with self.lock:
+            self.state['failures'] += 1
+            failed = self.state['failures'] >= 3 or not self.state['allowed']
+            if failed and self.state['allowed']:
+                self.state['last_change'] = time.time()
+            self.state.update(allowed=False if failed else self.state['allowed'], core_probe='unavailable' if failed else 'degraded', route_reason=str(error), rtt_ms=None)
+
+    def run(self):
+        while not self.closed.is_set():
+            nonce = uuid.uuid4().hex
+            start = time.monotonic()
+            try:
+                with socket.create_connection((self.host, self.port), timeout=3) as conn:
+                    _lgdt_configure_socket(conn, 3)
+                    conn.sendall(_lgdt_json_bytes({'type': 'transport_probe', 'gateway': self.gateway, 'nonce': nonce}) + b'\n')
+                    response = _lgdt_read_line(conn, 65536)
+                if response.get('type') != 'transport_probe_ack' or response.get('nonce') != nonce or response.get('version') != _lgdt_VERSION:
+                    raise ValueError('invalid core probe response')
+                enabled = response.get('enabled') is True
+                with self.lock:
+                    changed = self.state['allowed'] != enabled
+                    self.state.update(core_probe='ready' if enabled else 'disabled', allowed=enabled, failures=0, rtt_ms=round((time.monotonic() - start) * 1000, 2), route_reason='core ingress ready' if enabled else 'administratively disabled')
+                    if changed:
+                        self.state['last_change'] = time.time()
+            except (OSError, ValueError, ConnectionError) as exc:
+                self.record_failure(exc)
+            self.closed.wait(self.interval)
+
+class _lgdt_TunnelJsonSender:
+
+    def __init__(self, path, send_queue, outbox, metrics=None, log=print):
+        self.path, self.queue, self.outbox, self.metrics, self.log = (path, send_queue, outbox, metrics, log)
+        self.conn = None
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+    def _send(self, wire, delivery_id):
+        self.path.require()
+        if self.conn is None:
+            self.conn = socket.create_connection((self.path.host, self.path.port), timeout=5)
+            _lgdt_configure_socket(self.conn, 10)
+        self.conn.sendall(wire.encode('utf-8') + b'\n')
+        ack = _lgdt_read_line(self.conn, 65536)
+        if ack.get('type') != 'transport_ack' or ack.get('delivery_id') != delivery_id:
+            raise ValueError('invalid delivery ACK')
+        if ack.get('status') not in ('accepted', 'duplicate'):
+            raise ConnectionError('core rejected delivery: ' + str(ack.get('reason', 'unknown')))
+
+    def run_forever(self):
+        current = None
+        while True:
+            try:
+                pending = self.outbox.next()
+                if pending:
+                    item = {'json_data': pending['wire'], 'delivery_id': pending['delivery_id'], 'slice_id': pending['slice_id']}
+                elif current is not None:
+                    item = current
+                else:
+                    try:
+                        item = self.queue.get(timeout=0.25)
+                    except queue.Empty:
+                        continue
+                    if item.get('delivery_id'):
+                        if not self.outbox.contains(item['delivery_id']):
+                            continue
+                    else:
+                        payload = json.loads(item['json_data'])
+                        delivery_id = uuid.uuid4().hex
+                        payload['_transport'] = {'version': _lgdt_VERSION, 'delivery_id': delivery_id, 'critical': False}
+                        item = dict(item, json_data=_lgdt_json_bytes(payload).decode('utf-8'), delivery_id=delivery_id)
+                    current = item
+                start = time.monotonic()
+                self._send(item['json_data'], item['delivery_id'])
+                if pending:
+                    self.outbox.ack(item['delivery_id'])
+                if current and current['delivery_id'] == item['delivery_id']:
+                    current = None
+                if self.metrics:
+                    self.metrics.record_output(item.get('slice_id', 'mmtc'), len(item['json_data'].encode()) + 1, (time.monotonic() - start) * 1000)
+            except (OSError, ValueError, ConnectionError, sqlite3.Error) as exc:
+                self.close()
+                self.log('[TUNNEL][JSON] delivery pending: {}'.format(exc))
+                time.sleep(2)
+
+def _lgdt_supervised_call(target, *args, stop_event=None):
+    """Recover a terminated worker without restarting the modem or the process."""
+    while stop_event is None or not stop_event.is_set():
+        try:
+            target(*args)
+            print('[WORKER] {} returned; restarting in 2s'.format(target.__name__), flush=True)
+        except Exception as exc:
+            print('[WORKER] {} failed: {!r}; restarting in 2s'.format(target.__name__, exc), flush=True)
+        if stop_event is None:
+            time.sleep(2)
+        else:
+            stop_event.wait(2)
+PathManager = _lgdt_PathManager
+Outbox = _lgdt_Outbox
+DurableQueue = _lgdt_DurableQueue
+TunnelJsonSender = _lgdt_TunnelJsonSender
+supervised_call = _lgdt_supervised_call
+# END integrated transport
+
+
+_TUNNEL_PATH = None
+_TUNNEL_OUTBOX = None
+
 PACKET_HEADER = struct.Struct("!4sQ")
 VALID_PACKET_TYPES = {"VID0", "SNAP"}
 
@@ -215,6 +563,8 @@ def extract_sub1g_wind(payload):
 
     normalized = dict(payload)
     normalized["windspeed"] = wind
+    # 风速时间戳改用网关本机北京时间覆写，不采用传感器传过来的时间（传感器侧时钟不准，2026-09-23）。
+    normalized["timestamp"] = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     log(
         "[JSON][SHORTWAVE][NORM] sub1g wind normalized: "
         "data_content.wind={} -> windspeed={} sensor_type={}".format(
@@ -324,14 +674,11 @@ def extract_windspeed_number(value):
     """提取风速值的数字部分用于短波短信，如 '0m/s' -> '0.0', '12.5m/s' -> '12.5'。
 
     短波工控机无法解析不带小数点的数字（如 '0'），必须保证输出带小数点。
-    无数字时返回空串（此前会误补成 '.0'，把垃圾读数伪装成 0.0）。
     """
     if value is None:
         return ""
     m = re.search(r"[-+]?\d+(?:\.\d+)?", str(value))
-    if not m:
-        return ""
-    result = m.group(0)
+    result = m.group(0) if m else ""
     if "." not in result:
         result += ".0"
     return result
@@ -489,6 +836,13 @@ class SliceMetricsCollector:
         return "busy" if ratio >= 0.70 else "normal"
 
     def snapshot(self):
+        result = self._snapshot_without_transport()
+        if _TUNNEL_PATH is not None:
+            result["transport"] = _TUNNEL_PATH.snapshot()
+            result["transport"]["critical_pending"] = _TUNNEL_OUTBOX.count()
+        return result
+
+    def _snapshot_without_transport(self):
         now_mono = time.monotonic()
         with self._lock:
             interval = max(0.001, now_mono - self._last_snapshot)
@@ -2842,14 +3196,8 @@ class ProtocolBaoTongServer(threading.Thread):
         self.current_session = None
         self.session_lock = threading.Lock()
         self.data_lock = threading.Lock()
-        # 短波短信业务缓存：电台每次被叫答最新值（常发火情）。
         self.latest_fire = None
         self.latest_windspeed = None
-        # 卫星专用业务缓存（2026-09-22 与短波分开维护，同源同值）：卫星
-        # 火情走严格跳变（SATELLITE_FIRE_JUMP_ONLY），短波常发最新火情，
-        # 两条链路各读各的缓存，互不影响。
-        self.sat_latest_fire = None
-        self.sat_latest_windspeed = None
         # 58所 sub1g 温湿度缓存（update_th_cache 维护）：仅供卫星 TH 上行
         # 读取，短波短信业务完全不使用（温湿度与短波电台无关）。
         self.latest_th = None
@@ -2942,39 +3290,26 @@ class ProtocolBaoTongServer(threading.Thread):
                         "value": fire,
                         "timestamp": timestamp,
                     }
-                    # 卫星侧同值独立副本（见 __init__ 注释）。
-                    self.sat_latest_fire = dict(self.latest_fire)
                     updated.add("fire")
                     # 火情跳变（true<->false，或首条缓存）通知卫星即时上报。
                     if fire != previous_fire:
                         fire_jump = (previous_fire, fire)
             if "windspeed" in payload:
                 windspeed = as_windspeed_string(payload.get("windspeed"))
-                number = (
-                    extract_windspeed_number(windspeed) if windspeed else ""
-                )
-                try:
-                    wind_value = float(number)
-                except (TypeError, ValueError):
-                    wind_value = None
-                # 风速物理范围 0-60 m/s：超范围/无数字的读数（传感器无效值，
-                # 如 255）不覆盖缓存，保留最后一个合法值等传感器恢复——与
-                # update_th_cache 的越界处理一致。
-                if wind_value is None or not (0.0 <= wind_value <= 60.0):
-                    log(
-                        "[JSON][SHORTWAVE][WARN] invalid/out-of-range "
-                        "windspeed={!r}; cache not updated (valid 0-60 m/s)".format(
-                            payload.get("windspeed")
-                        ),
-                        level="WARN",
-                    )
-                else:
+                if windspeed is not None:
                     self.latest_windspeed = {
                         "value": windspeed,
                         "timestamp": timestamp,
                     }
-                    self.sat_latest_windspeed = dict(self.latest_windspeed)
                     updated.add("windspeed")
+                else:
+                    log(
+                        "[JSON][SHORTWAVE][WARN] invalid windspeed={!r}; "
+                        "shortwave windspeed cache not updated".format(
+                            payload.get("windspeed")
+                        ),
+                        level="WARN",
+                    )
         if fire_jump is not None and self.satellite_uplink is not None:
             log(
                 "[SATELLITE][FIRE-JUMP] fire {} -> {}; requesting urgent "
@@ -3261,7 +3596,7 @@ class MediaCloudConnection:
         sock.connect((self.host, self.port))
         local_addr = sock.getsockname()
         remote_addr = sock.getpeername()
-        sock.settimeout(None)
+        sock.settimeout(10.0 if _TUNNEL_PATH is not None else None)
         detail_log(
             "[MEDIA][SEND] TCP connected local={}:{} remote={}:{}".format(
                 local_addr[0], local_addr[1], remote_addr[0], remote_addr[1]
@@ -3285,6 +3620,8 @@ class MediaCloudConnection:
             self.connect()
 
     def send_raw_packet(self, raw_packet):
+        if _TUNNEL_PATH is not None:
+            _TUNNEL_PATH.require()
         self.ensure_connected()
         self.sock.sendall(raw_packet)
 
@@ -3522,10 +3859,6 @@ class SatelliteUplink(threading.Thread):
     2026-09-21 温湿度接入（规范 4.2，58所 sub1g TemperatureHumidity 报文）：
     - 温湿度借火情网关（gw1）的周期时隙上星：TH 周期帧 + F 跳变帧共存，
       优先级 F 跳变 > TH 周期；风速网关不发 TH。与短波短信无关。
-    2026-09-22 卫星业务缓存与短波分离：
-    - 卫星读 sat_latest_fire / sat_latest_windspeed，短波短信读
-      latest_*；同一 JSON 入口写两份，值相同、存储独立，两链路互不
-      干扰（短波常发最新火情，卫星只在火情跳变时发帧）。
     """
 
     def __init__(
@@ -3582,13 +3915,11 @@ class SatelliteUplink(threading.Thread):
         return None
 
     def _snapshot_business_value(self):
-        """从卫星专用业务缓存取当前值，返回 (sensor_kind, value, timestamp)。
+        """从短波业务缓存取当前值，返回 (sensor_kind, value, timestamp)。
 
-        2026-09-22 起卫星读 sat_latest_* 独立缓存（与短波 latest_* 同源
-        同值、分开维护），两链路互不影响。sensor_kind 为 'TH' / 'F' /
-        'WS'；本网关无业务或缓存无数据时返回 (None, None, None)。温湿度
-        缓存目前只有火灾/风速业务在维护，TH 暂不可用；后续接入温湿度传
-        感器时在此扩展。
+        sensor_kind 为 'TH' / 'F' / 'WS'；本网关无业务或缓存无数据时返回
+        (None, None, None)。温湿度缓存目前只有火灾/风速业务在维护，TH 暂
+        不可用；后续接入温湿度传感器时在此扩展。
         """
         source = self.business_source
         if source is None:
@@ -3596,7 +3927,7 @@ class SatelliteUplink(threading.Thread):
         business = getattr(source, "business", None)
         try:
             if business == "windspeed":
-                record = source.sat_latest_windspeed
+                record = source.latest_windspeed
                 if record is None:
                     return None, None, None
                 number = extract_windspeed_number(record.get("value"))
@@ -3614,7 +3945,7 @@ class SatelliteUplink(threading.Thread):
                     value = 0.0
                 return "WS", value, record.get("timestamp")
             if business == "fire":
-                record = source.sat_latest_fire
+                record = source.latest_fire
                 if record is None:
                     return None, None, None
                 fire = parse_fire_string(record.get("value"))
@@ -4421,7 +4752,7 @@ def validate_args(args):
 
 
 def main():
-    global DETAIL_LOG_ENABLED
+    global DETAIL_LOG_ENABLED, _TUNNEL_PATH, _TUNNEL_OUTBOX
 
     args = build_parser().parse_args()
     validate_args(args)
@@ -4443,9 +4774,16 @@ def main():
         return
 
     log_every = max(1, int(args.log_every))
+    business_host = TUNNEL_CORE_HOST if TUNNEL_ENABLED else args.cloud_host
+    business_port = TUNNEL_CORE_PORT if TUNNEL_ENABLED else args.cloud_port
     link_status_host = args.link_status_host or args.cloud_host
 
     json_queue = DroppingQueue(args.json_queue)
+    if TUNNEL_ENABLED:
+        _TUNNEL_OUTBOX = Outbox(TUNNEL_OUTBOX_PATH)
+        json_queue = DurableQueue(json_queue, _TUNNEL_OUTBOX, args.gateway)
+        _TUNNEL_PATH = PathManager(args.gateway, business_host, business_port, log=log)
+        _TUNNEL_PATH.start()
     media_queue = DroppingQueue(args.media_queue)
     slice_metrics = SliceMetricsCollector(args.gateway, media_queue, json_queue)
 
@@ -4470,6 +4808,8 @@ def main():
         json_queue,
         slice_metrics,
     )
+    if TUNNEL_ENABLED:
+        json_sender = TunnelJsonSender(_TUNNEL_PATH, json_queue, _TUNNEL_OUTBOX, metrics=slice_metrics, log=log)
     slice_reporter = SliceMetricsReporter(
         args.cloud_host,
         args.slice_metrics_port,
@@ -4592,7 +4932,7 @@ def main():
     detail_log("[MAIN] thread started: {}".format(baotong_server.name))
 
     edge_heartbeat_thread = threading.Thread(
-        target=edge_heartbeat_reporter.run_forever,
+        target=lambda *a: supervised_call(edge_heartbeat_reporter.run_forever, *a),
         daemon=True,
         name="edge-heartbeat-sender",
     )
@@ -4601,7 +4941,7 @@ def main():
 
     if args.whitelist_interval > 0:
         whitelist_thread = threading.Thread(
-            target=whitelist.sync_loop,
+            target=lambda *a: supervised_call(whitelist.sync_loop, *a),
             daemon=True,
             name="whitelist-sync",
         )
@@ -4612,7 +4952,7 @@ def main():
 
     # 2. JSON 云端发送线程，目标 11500。
     json_sender_thread = threading.Thread(
-        target=json_sender.run_forever,
+        target=lambda *a: supervised_call(json_sender.run_forever, *a),
         daemon=True,
         name="json-cloud-sender",
     )
@@ -4620,7 +4960,7 @@ def main():
     detail_log("[MAIN] thread started: {}".format(json_sender_thread.name))
 
     slice_reporter_thread = threading.Thread(
-        target=slice_reporter.run_forever,
+        target=lambda *a: supervised_call(slice_reporter.run_forever, *a),
         daemon=True,
         name="slice-metrics-sender",
     )
@@ -4629,11 +4969,11 @@ def main():
 
     # 3. 视频/图片云端发送线程，目标 11500。
     media_sender_thread = threading.Thread(
-        target=media_cloud_sender_loop,
+        target=lambda *a: supervised_call(media_cloud_sender_loop, *a),
         args=(
             media_queue,
-            args.cloud_host,
-            args.cloud_port,
+            business_host,
+            business_port,
             args.gateway,
             args.gateway_handshake,
             log_every,
@@ -4647,7 +4987,7 @@ def main():
 
     # 4. JSON 统一接收端口 8888。
     json_listener_thread = threading.Thread(
-        target=serve_json,
+        target=lambda *a: supervised_call(serve_json, *a),
         args=(
             args.json_listen_host,
             args.json_listen_port,

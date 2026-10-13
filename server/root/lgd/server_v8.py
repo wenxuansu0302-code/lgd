@@ -66,7 +66,123 @@ import select
 import signal
 from collections import defaultdict, deque
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    from http.server import HTTPServer
+    from socketserver import ThreadingMixIn
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+# BEGIN integrated transport v1.2 (generated from audited source)
+import collections
+
+import contextlib
+
+import hashlib
+
+import ipaddress
+
+import json
+
+import os
+
+import queue
+
+import re
+
+import socket
+
+import sqlite3
+
+import struct
+
+import subprocess
+
+import threading
+
+import time
+
+import uuid
+
+def _lgdt_configure_socket(conn, timeout=10):
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for name, value in (('TCP_KEEPIDLE', 30), ('TCP_KEEPINTVL', 10), ('TCP_KEEPCNT', 3)):
+        option = getattr(socket, name, None)
+        if option is not None:
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, option, value)
+            except OSError:
+                pass
+    conn.settimeout(timeout)
+
+class _lgdt_DownstreamConnections:
+    """One VPN core consumer per channel; replace old sockets on reconnect."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sockets = {}
+
+    def claim(self, key, conn):
+        with self.lock:
+            old = self.sockets.get(key)
+            self.sockets[key] = conn
+        if old is not None and old is not conn:
+            try:
+                old.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            old.close()
+
+    def current(self, key, conn):
+        with self.lock:
+            return self.sockets.get(key) is conn
+
+    def release(self, key, conn):
+        with self.lock:
+            if self.sockets.get(key) is conn:
+                self.sockets.pop(key, None)
+
+    @staticmethod
+    def eof(conn):
+        import select
+        readable, _, _ = select.select([conn], [], [], 0)
+        if not readable:
+            return False
+        try:
+            return conn.recv(1, socket.MSG_PEEK) == b''
+        except OSError:
+            return True
+DownstreamConnections = _lgdt_DownstreamConnections
+configure_socket = _lgdt_configure_socket
+# END integrated transport
+
+
+_CORE_VPN_HOST = None
+_DOWNSTREAM = DownstreamConnections()
+_POLICY_PATH = "/root/lgd/tunnel_group_policy.json"
+_POLICY_WRITE_LOCK = threading.Lock()
+
+def _save_group_policy():
+    with _POLICY_WRITE_LOCK:
+        _write_group_policy()
+
+def _write_group_policy():
+    with group_lock:
+        snapshot = dict(group_enabled)
+    temp = _POLICY_PATH + ".tmp"
+    with open(temp,"w") as out:
+        json.dump(snapshot,out)
+        out.flush(); os.fsync(out.fileno())
+    os.replace(temp,_POLICY_PATH)
+
+def _vpn_core_allowed(addr):
+    return _CORE_VPN_HOST is None or addr[0] == _CORE_VPN_HOST
+
+def _downstream_alive(key,conn):
+    return _DOWNSTREAM.current(key,conn) and not _DOWNSTREAM.eof(conn)
 
 # ======================== Defaults ========================
 DEFAULT_LISTEN_HOST = "0.0.0.0"
@@ -791,6 +907,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 with group_lock:
                     group_enabled[group] = False
                 clear_group_queues(group)
+                _save_group_policy()
                 # 停止心跳
                 self._send_response(200, {"status": "ok", "group": group, "action": "stop"})
                 print("[CONTROL] Group %d stopped" % group)
@@ -803,11 +920,19 @@ class ControlHandler(BaseHTTPRequestHandler):
                     raise ValueError
                 with group_lock:
                     group_enabled[group] = True
+                _save_group_policy()
                 # 恢复心跳
                 self._send_response(200, {"status": "ok", "group": group, "action": "recover"})
                 print("[CONTROL] Group %d recovered" % group)
             except Exception:
                 self._send_response(400, {"status": "error", "message": "invalid group"})
+        elif path == '/transport':
+            with group_lock:
+                groups = dict(group_enabled)
+            self._send_response(200, {"vpn_backend":"nebula","public_udp_port":11990,
+                                     "server_vpn":"10.77.0.1","core_vpn":_CORE_VPN_HOST,
+                                     "application_role":"legacy relay and management",
+                                     "group_enabled":groups})
         else:
             self._send_response(404, {"status": "error", "message": "not found"})
 
@@ -1124,6 +1249,8 @@ def serve_core_clients(database, runtime, host, port, send_interval, ack_timeout
             except socket.timeout:
                 continue
 
+            if not _vpn_core_allowed(peer):
+                client.close(); continue
             configure_client_socket(client)
             peer_text = "%s:%s" % peer
             runtime.set_core(True, peer_text)
@@ -1489,6 +1616,11 @@ def handle_framed_sender(conn, addr, storage, initial_prefix, custom_id):
 
 
 def handle_framed_receiver(conn, addr, gateway_id, pre_buffer_count):
+    if not _vpn_core_allowed(addr):
+        conn.close(); return
+    key = ("media",gateway_id) if _CORE_VPN_HOST else ("media",gateway_id,addr)
+    _DOWNSTREAM.claim(key,conn)
+    configure_socket(conn,10)
     frame_queue = framed_queues[gateway_id]
     print(
         "[+OLD DOWN] core connected for %s on old channel (%s:%s)"
@@ -1499,6 +1631,8 @@ def handle_framed_receiver(conn, addr, gateway_id, pre_buffer_count):
         buffer = []
         deadline = time.time() + 5.0
         while len(buffer) < pre_buffer_count and time.time() < deadline:
+            if not _downstream_alive(key,conn):
+                raise ConnectionError("core closed or replaced")
             try:
                 buffer.append(frame_queue.get(timeout=0.2))
             except queue.Empty:
@@ -1515,9 +1649,10 @@ def handle_framed_receiver(conn, addr, gateway_id, pre_buffer_count):
 
         while True:
             try:
-                gw_id, timestamp, seq, header, body = frame_queue.get(timeout=10.0)
+                if not _downstream_alive(key,conn):
+                    raise ConnectionError("core closed or replaced")
+                gw_id, timestamp, seq, header, body = frame_queue.get(timeout=1.0)
             except queue.Empty:
-                print("[OLD DOWN] %s no new frame, waiting..." % gateway_id)
                 continue
 
             send_forward_packet(conn, gw_id, timestamp, seq, header, body)
@@ -1536,6 +1671,7 @@ def handle_framed_receiver(conn, addr, gateway_id, pre_buffer_count):
     except (ConnectionError, BrokenPipeError, ConnectionResetError, OSError):
         print("[-OLD DOWN] core disconnected for %s" % gateway_id)
     finally:
+        _DOWNSTREAM.release(key,conn)
         try:
             conn.close()
         except OSError:
@@ -1926,6 +2062,11 @@ def start_gateway4_fire_downstream(host, port):
 
 
 def handle_json_receiver(conn, addr, gateway_id):
+    if not _vpn_core_allowed(addr):
+        conn.close(); return
+    key = ("json",gateway_id) if _CORE_VPN_HOST else ("json",gateway_id,addr)
+    _DOWNSTREAM.claim(key,conn)
+    configure_socket(conn,10)
     config = JSON_GATEWAY_PORT_MAP[gateway_id]
     json_queue = json_queues[gateway_id]
     print(
@@ -1941,14 +2082,15 @@ def handle_json_receiver(conn, addr, gateway_id):
         with conn:
             while True:
                 try:
-                    json_data = json_queue.get(timeout=10.0)
+                    if not _downstream_alive(key,conn):
+                        raise ConnectionError("core closed or replaced")
+                    json_data = json_queue.get(timeout=1.0)
                 except queue.Empty:
-                    print(
-                        "[JSON DOWN] %s port %s has no new JSON, waiting..."
-                        % (config["display"], config["port"])
-                    )
                     continue
 
+                if not _DOWNSTREAM.current(key,conn):
+                    json_queue.put(json_data)
+                    raise ConnectionError("consumer replaced before send")
                 conn.sendall(json_data.encode("utf-8") + b"\n")
                 total_sent += 1
 
@@ -1968,6 +2110,7 @@ def handle_json_receiver(conn, addr, gateway_id):
             % (config["display"], config["port"], exc)
         )
     finally:
+        _DOWNSTREAM.release(key,conn)
         print(
             "[-JSON DOWN] core closed for %s (%s:%s)"
             % (config["display"], addr[0], addr[1])
@@ -2313,7 +2456,7 @@ def start_edge_heartbeat_server(host, port, registry, max_line_size):
 
 # ======================== Main ========================
 def main():
-    global gateway4_fire_queue
+    global gateway4_fire_queue, _CORE_VPN_HOST
 
     parser = argparse.ArgumentParser(
         description="Server router compatible with old framed protocol and new JSON protocol."
@@ -2348,7 +2491,17 @@ def main():
         default=DEFAULT_GATEWAY4_FIRE_DOWNSTREAM_PORT,
         help="Gateway4 fire JSON output port (11421)",
     )
+    parser.add_argument("--core-vpn-host", default=None, help="Restrict core consumers to this VPN IP")
+    parser.add_argument("--clear-satellite-on-start", action="store_true", help="Explicitly discard satellite records on startup")
     args = parser.parse_args()
+    _CORE_VPN_HOST = args.core_vpn_host
+    if os.path.isfile(_POLICY_PATH):
+        with open(_POLICY_PATH) as policy_file:
+            saved_policy = json.load(policy_file)
+        with group_lock:
+            for group in (1,2,3):
+                if str(group) in saved_policy:
+                    group_enabled[group] = bool(saved_policy[str(group)])
 
     # 初始化队列
     for gateway_id in FRAMED_GATEWAY_PORT_MAP:
@@ -2382,9 +2535,12 @@ def main():
     # 启动时清空卫星消息表（relay_messages）
     conn = satellite_db.connect()
     try:
-        conn.execute("DELETE FROM relay_messages")
-        conn.commit()
-        print("[SATELLITE] Cleared relay_messages table on startup")
+        if args.clear_satellite_on_start:
+            conn.execute("DELETE FROM relay_messages")
+            conn.commit()
+            print("[SATELLITE] Cleared relay_messages table on startup")
+        else:
+            print("[SATELLITE] Preserved relay_messages on startup")
     except Exception as e:
         print("[SATELLITE] WARNING: Failed to clear relay_messages table: %s" % e)
     finally:

@@ -1,0 +1,7 @@
+[Unit]
+Description=LGD complete node stack
+Wants=lgd-tcp-carrier.service lgd-nebula.service lgd-server-v8.service
+After=lgd-tcp-carrier.service lgd-nebula.service lgd-server-v8.service
+
+[Install]
+WantedBy=multi-user.target

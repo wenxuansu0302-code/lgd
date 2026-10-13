@@ -1,0 +1,14 @@
+[Unit]
+PartOf=lgd.target
+Description=LGD TCP carrier for Nebula
+Wants=network.target
+After=network.target
+[Service]
+Type=simple
+ExecStartPre=/bin/sh /etc/lgd-tcp/restrict-underlay.sh
+ExecStart=/usr/sbin/openvpn --config /etc/lgd-tcp/config.conf
+Restart=always
+RestartSec=3
+UMask=0077
+[Install]
+WantedBy=multi-user.target

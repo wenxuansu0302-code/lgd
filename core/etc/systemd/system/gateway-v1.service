@@ -1,0 +1,22 @@
+[Unit]
+Description=LGD integrated core gateway
+Wants=quectel-cm.service lgd-nebula.service lgd-tcp-carrier.service
+After=network.target quectel-cm.service
+PartOf=lgd.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/lgd
+ExecStartPre=/sbin/ip link set fm1-mac6 up
+ExecStartPre=/sbin/ip addr replace 192.168.2.1/24 dev fm1-mac6
+ExecStartPre=/sbin/ip link set fm1-mac2 up
+ExecStartPre=/sbin/ip addr replace 192.168.0.233/24 dev fm1-mac2
+ExecStart=/usr/bin/python3 -u /root/lgd/gateway_v1.py --server-host 10.77.0.1 --b-host 10.77.0.1
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

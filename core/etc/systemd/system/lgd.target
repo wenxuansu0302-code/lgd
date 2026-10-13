@@ -1,0 +1,7 @@
+[Unit]
+Description=LGD complete node stack
+Wants=quectel-cm.service lgd-tcp-carrier.service lgd-nebula.service gateway-v1.service
+After=quectel-cm.service lgd-tcp-carrier.service lgd-nebula.service gateway-v1.service
+
+[Install]
+WantedBy=multi-user.target

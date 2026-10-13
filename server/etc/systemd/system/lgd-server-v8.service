@@ -1,0 +1,18 @@
+[Unit]
+Description=LGD V8 integrated server
+Wants=network-online.target lgd-nebula.service lgd-tcp-carrier.service
+After=network-online.target
+PartOf=lgd.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/lgd
+ExecStart=/usr/bin/python3 -u /root/lgd/server_v8.py --edge-heartbeat-timeout 20 --core-vpn-host 10.77.0.10
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+[Unit]
+Description=LGD independent 5G dialler
+After=network.target
+PartOf=lgd.target
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/ip link set fm1-mac2 up
+ExecStartPre=/sbin/ip addr replace 192.168.0.233/24 dev fm1-mac2
+ExecStartPre=/sbin/ip link set fm1-mac4 up
+ExecStartPre=/sbin/ip addr replace 192.168.1.106/24 dev fm1-mac4
+ExecStartPre=/sbin/ip link set fm1-mac6 up
+ExecStartPre=/sbin/ip addr replace 192.168.2.1/24 dev fm1-mac6
+ExecStart=/bin/bash /root/start_lgd_5g.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

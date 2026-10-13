@@ -1,0 +1,19 @@
+[Unit]
+Description=LGD GW2 integrated business
+Wants=quectel-cm.service lgd-nebula.service lgd-tcp-carrier.service
+After=network.target quectel-cm.service
+PartOf=lgd.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/lgd
+ExecStart=/usr/bin/python3 -u /root/lgd/gateway_merged.py --satellite-port auto --media-listen-host 0.0.0.0 --media-listen-port 7777 --json-listen-host 0.0.0.0 --json-listen-port 8888 --cloud-host 10.77.0.1 --cloud-port 11500 --baotong-host 192.168.2.1 --baotong-port 9100 --callee-id 025203 --gateway gateway_2 --gateway-handshake --json-max-buffer 20971520 --json-queue 1000 --media-queue 120 --log-every 30 --time-set-interval 2.0 --whitelist-url http://10.77.0.1:11502/ --whitelist-interval 30.0 --whitelist-file /root/lgd/whitelist.json --whitelist-filter
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

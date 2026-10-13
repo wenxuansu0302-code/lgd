@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+*.log
+*.key
+*.pem
+*.p12
+*.pfx
+*.key.dpapi
+debug-host
+debug-client
+private_pki/
+.env
+.env.*
