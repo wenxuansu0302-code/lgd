@@ -112,6 +112,10 @@ RESYNC_MARKERS = (
 
 # Nebula is installed as an independent service; business goes to the core.
 TUNNEL_ENABLED = True
+# This is independent from TUNNEL_ENABLED.  An installed tunnel can remain
+# probeable while business admission is held in standby (the GW4 profile).
+TUNNEL_BUSINESS_MODE = "active"
+TUNNEL_POLICY_VERSION = 1
 TUNNEL_CORE_HOST = "10.77.0.10"
 TUNNEL_CORE_PORT = 11500
 TUNNEL_CONTROL_HOST = "10.77.0.1"

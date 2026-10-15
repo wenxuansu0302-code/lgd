@@ -164,6 +164,12 @@ _CORE_VPN_HOST = None
 _DOWNSTREAM = DownstreamConnections()
 _POLICY_PATH = "/root/lgd/tunnel_group_policy.json"
 _POLICY_WRITE_LOCK = threading.Lock()
+TUNNEL_POLICY_VERSION = 1
+TUNNEL_SCENE_MODES = {
+    "gateway_1": "active",
+    "gateway_2": "active",
+    "gateway_4": "standby",
+}
 
 def _save_group_policy():
     with _POLICY_WRITE_LOCK:
@@ -932,6 +938,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send_response(200, {"vpn_backend":"nebula","public_udp_port":11990,
                                      "server_vpn":"10.77.0.1","core_vpn":_CORE_VPN_HOST,
                                      "application_role":"legacy relay and management",
+                                     "policy_version":TUNNEL_POLICY_VERSION,
+                                     "scene_modes":dict(TUNNEL_SCENE_MODES),
                                      "group_enabled":groups})
         else:
             self._send_response(404, {"status": "error", "message": "not found"})

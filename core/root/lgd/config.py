@@ -175,4 +175,28 @@ TUNNEL_LISTEN_HOST = "10.77.0.10"
 TUNNEL_LISTEN_PORT = 11500
 TUNNEL_PEERS = {"10.77.0.11":"gateway_1", "10.77.0.12":"gateway_2", "10.77.0.14":"gateway_4"}
 TUNNEL_INBOX_PATH = "/root/lgd/tunnel_inbox.db"
+# Transport reachability and business admission are deliberately separate.
+# GW4 owns a certificate and can answer probes, but it has no tunnel business
+# route in this release.  Group recovery must never turn standby into active.
+TUNNEL_SCENES = {
+    "gateway_1": {"group": 1, "mode": "active", "allowed_kinds": ("JSON", "VID0", "SNAP")},
+    # GW2 SNAP frames may arrive on the shared media stream; the existing
+    # core output map intentionally has no snapshot destination for 11401.
+    "gateway_2": {"group": 2, "mode": "active", "allowed_kinds": ("JSON", "VID0", "SNAP")},
+    "gateway_4": {"group": 3, "mode": "standby", "allowed_kinds": ()},
+}
+TUNNEL_JSON_ROUTES = {"gateway_1": 11406, "gateway_2": 11407}
+TUNNEL_FRAME_ROUTES = {"gateway_1": 11400, "gateway_2": 11401}
+# Only one producer may publish a logical channel.  In particular 11408 is
+# the existing WiFi channel and is not a GW4 tunnel route.
+TUNNEL_SOURCE_OWNER = {
+    (11400, "VID0"): "tunnel",
+    (11400, "SNAP"): "tunnel",
+    (11401, "VID0"): "tunnel",
+    (11406, "JSON"): "tunnel",
+    (11407, "JSON"): "tunnel",
+    (11403, "VID0"): "legacy",
+    (11408, "JSON"): "legacy",
+}
+TUNNEL_POLICY_VERSION = 1
 CLEAR_SATELLITE_ON_START = False

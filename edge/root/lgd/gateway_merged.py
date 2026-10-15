@@ -316,13 +316,16 @@ class _lgdt_NebulaMonitor:
 
 class _lgdt_PathManager:
 
-    def __init__(self, gateway, host, port, log=print, interval=2):
+    def __init__(self, gateway, host, port, business_mode='active', log=print, interval=2):
         self.gateway, self.host, self.port = (_lgdt_canonical(gateway), host, int(port))
         if self.gateway is None:
             raise ValueError('unknown tunnel gateway')
+        if business_mode not in ('active', 'standby'):
+            raise ValueError('invalid tunnel business mode')
+        self.business_mode = business_mode
         self.log, self.interval = (log, interval)
         self.lock = threading.Lock()
-        self.state = {'vpn_backend': 'nebula', 'security_mode': 'strict_e2e', 'virtual_peer': host, 'application_target': '{}:{}'.format(host, port), 'overlay_mode': 'unknown', 'core_probe': 'starting', 'allowed': False, 'route_reason': 'not yet probed', 'last_change': time.time(), 'failures': 0, 'rtt_ms': None}
+        self.state = {'vpn_backend': 'nebula', 'security_mode': 'strict_e2e', 'virtual_peer': host, 'application_target': '{}:{}'.format(host, port), 'overlay_mode': 'unknown', 'core_probe': 'starting', 'business_mode': business_mode, 'business_allowed': False, 'allowed': False, 'allowed_kinds': [], 'policy_version': None, 'route_reason': 'not yet probed', 'last_change': time.time(), 'failures': 0, 'rtt_ms': None}
         self.closed = threading.Event()
         self.monitor = _lgdt_NebulaMonitor([host])
 
@@ -349,7 +352,10 @@ class _lgdt_PathManager:
             failed = self.state['failures'] >= 3 or not self.state['allowed']
             if failed and self.state['allowed']:
                 self.state['last_change'] = time.time()
-            self.state.update(allowed=False if failed else self.state['allowed'], core_probe='unavailable' if failed else 'degraded', route_reason=str(error), rtt_ms=None)
+            allowed = False if failed else self.state['allowed']
+            self.state.update(allowed=allowed, business_allowed=allowed,
+                              core_probe='unavailable' if failed else 'degraded',
+                              route_reason=str(error), rtt_ms=None)
 
     def run(self):
         while not self.closed.is_set():
@@ -362,10 +368,24 @@ class _lgdt_PathManager:
                     response = _lgdt_read_line(conn, 65536)
                 if response.get('type') != 'transport_probe_ack' or response.get('nonce') != nonce or response.get('version') != _lgdt_VERSION:
                     raise ValueError('invalid core probe response')
-                enabled = response.get('enabled') is True
+                remote_enabled = response.get('enabled') is True
+                policy_version = response.get('policy_version')
+                capabilities = response.get('capabilities') or []
+                policy_capable = policy_version == TUNNEL_POLICY_VERSION and 'scene_policy_v1' in capabilities
+                enabled = bool(self.business_mode == 'active' and remote_enabled and policy_capable)
+                reason = response.get('policy_reason') or response.get('reason')
+                if self.business_mode != 'active':
+                    reason = 'local_standby'
+                elif not policy_capable:
+                    reason = 'core_scene_policy_missing'
                 with self.lock:
                     changed = self.state['allowed'] != enabled
-                    self.state.update(core_probe='ready' if enabled else 'disabled', allowed=enabled, failures=0, rtt_ms=round((time.monotonic() - start) * 1000, 2), route_reason='core ingress ready' if enabled else 'administratively disabled')
+                    self.state.update(core_probe='ready', business_allowed=enabled,
+                                      allowed=enabled, failures=0,
+                                      allowed_kinds=response.get('allowed_kinds') or [],
+                                      policy_version=policy_version,
+                                      rtt_ms=round((time.monotonic() - start) * 1000, 2),
+                                      route_reason=reason or ('core ingress ready' if enabled else 'administratively disabled'))
                     if changed:
                         self.state['last_change'] = time.time()
             except (OSError, ValueError, ConnectionError) as exc:
@@ -468,7 +488,7 @@ BJ_TZ = timezone(timedelta(hours=8))
 # ======================================================================
 
 def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def bj_time_str():
@@ -1851,6 +1871,15 @@ def handle_json_client(
                     shortwave_payload,
                 )
             )
+
+        # A standby node remains fully probeable and keeps its local
+        # shortwave/satellite caches current, but does not create VPN business
+        # records or grow the durable outbox.
+        if TUNNEL_ENABLED and TUNNEL_BUSINESS_MODE != "active":
+            log("[JSON][TUNNEL] business suppressed by mode={}".format(
+                TUNNEL_BUSINESS_MODE
+            ))
+            return
 
         try:
             outgoing = enrich_payload(payload, gateway_id)
@@ -3655,6 +3684,12 @@ def handle_media_client(conn, addr, packet_queue, log_every, slice_metrics=None)
             elif packet_type == "SNAP":
                 recv_snapshot += 1
 
+            if TUNNEL_ENABLED and TUNNEL_BUSINESS_MODE != "active":
+                log("[MEDIA][TUNNEL] {} suppressed by mode={}".format(
+                    packet_type, TUNNEL_BUSINESS_MODE
+                ))
+                continue
+
             dropped_item = packet_queue.put(packet)
             dropped = dropped_item is not None
             if dropped and slice_metrics is not None:
@@ -4774,6 +4809,8 @@ def main():
         return
 
     log_every = max(1, int(args.log_every))
+    if TUNNEL_BUSINESS_MODE not in ("active", "standby"):
+        raise ValueError("TUNNEL_BUSINESS_MODE must be active or standby")
     business_host = TUNNEL_CORE_HOST if TUNNEL_ENABLED else args.cloud_host
     business_port = TUNNEL_CORE_PORT if TUNNEL_ENABLED else args.cloud_port
     link_status_host = args.link_status_host or args.cloud_host
@@ -4782,7 +4819,8 @@ def main():
     if TUNNEL_ENABLED:
         _TUNNEL_OUTBOX = Outbox(TUNNEL_OUTBOX_PATH)
         json_queue = DurableQueue(json_queue, _TUNNEL_OUTBOX, args.gateway)
-        _TUNNEL_PATH = PathManager(args.gateway, business_host, business_port, log=log)
+        _TUNNEL_PATH = PathManager(args.gateway, business_host, business_port,
+                                   business_mode=TUNNEL_BUSINESS_MODE, log=log)
         _TUNNEL_PATH.start()
     media_queue = DroppingQueue(args.media_queue)
     slice_metrics = SliceMetricsCollector(args.gateway, media_queue, json_queue)

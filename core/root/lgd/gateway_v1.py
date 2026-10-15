@@ -258,11 +258,12 @@ class _lgdt_Inbox(_lgdt_Database):
                 db.execute('UPDATE inbox SET published=1 WHERE gateway=? AND delivery_id=?', (gateway, delivery_id))
             return 'accepted'
 
-    def restore(self, publish):
+    def restore(self, publish, allowed=None):
         with self.lock, self.connect() as db:
             rows = db.execute('SELECT a.* FROM inbox a WHERE a.published=1 AND a.rowid=(SELECT b.rowid FROM inbox b WHERE b.gateway=a.gateway AND b.published=1 ORDER BY b.created DESC,b.rowid DESC LIMIT 1)').fetchall()
         for row in rows:
-            publish(row['gateway'], json.loads(row['body']))
+            if allowed is None or allowed(row['gateway'], 'JSON'):
+                publish(row['gateway'], json.loads(row['body']))
 
     def set_enabled(self, gateway, enabled):
         with self.lock, self.connect() as db:
@@ -278,9 +279,10 @@ class _lgdt_Inbox(_lgdt_Database):
 
 class _lgdt_CoreIngress:
 
-    def __init__(self, host, port, peers, inbox, publish_json, publish_media, log=print):
+    def __init__(self, host, port, peers, inbox, publish_json, publish_media, scenes=None, log=print):
         self.host, self.port, self.peers = (host, int(port), dict(peers))
         self.inbox, self.publish_json, self.publish_media, self.log = (inbox, publish_json, publish_media, log)
+        self.scenes = dict(scenes or {})
         self.lock = threading.RLock()
         self.clients = threading.BoundedSemaphore(32)
         self.closed = threading.Event()
@@ -295,14 +297,37 @@ class _lgdt_CoreIngress:
 
     def snapshot(self, gateway=None):
         with self.lock:
-            values = {name: dict(value, enabled=self.inbox.enabled(name)) for name, value in self.stats.items()}
+            values = {name: dict(value, **self.policy(name)) for name, value in self.stats.items()}
         for ip, name in self.peers.items():
-            value = values.setdefault(name, {'enabled': self.inbox.enabled(name), 'json_received': 0, 'media_received': 0})
+            value = values.setdefault(name, dict({'json_received': 0, 'media_received': 0}, **self.policy(name)))
             value.update(self.monitor.snapshot(ip))
             value['virtual_peer'] = ip
         if gateway:
-            return values.get(_lgdt_canonical(gateway), {'enabled': self.inbox.enabled(_lgdt_canonical(gateway)), 'json_received': 0, 'media_received': 0})
-        return {'vpn_backend': 'nebula', 'security_mode': 'strict_e2e', 'listen': '{}:{}'.format(self.host, self.port), 'gateways': values, 'overlay_mode': 'unknown', 'listener_state': self.listener_state, 'listener_error': self.listener_error}
+            name = _lgdt_canonical(gateway)
+            return values.get(name, dict({'json_received': 0, 'media_received': 0}, **self.policy(name)))
+        return {'vpn_backend': 'nebula', 'security_mode': 'strict_e2e', 'policy_version': TUNNEL_POLICY_VERSION, 'listen': '{}:{}'.format(self.host, self.port), 'gateways': values, 'overlay_mode': 'unknown', 'listener_state': self.listener_state, 'listener_error': self.listener_error}
+
+    def policy(self, gateway):
+        scene = self.scenes.get(gateway, {})
+        mode = scene.get('mode', 'disabled')
+        group_enabled = self.inbox.enabled(gateway)
+        kinds = tuple(scene.get('allowed_kinds', ())) if mode == 'active' else ()
+        enabled = bool(mode == 'active' and group_enabled and kinds)
+        if mode != 'active':
+            reason = mode
+        elif not group_enabled:
+            reason = 'group_disabled'
+        elif not kinds:
+            reason = 'no_authorized_routes'
+        else:
+            reason = 'ready'
+        return {'enabled': enabled, 'business_mode': mode, 'group_enabled': group_enabled,
+                'allowed_kinds': list(kinds), 'policy_version': TUNNEL_POLICY_VERSION,
+                'policy_reason': reason}
+
+    def business_allowed(self, gateway, kind):
+        policy = self.policy(gateway)
+        return bool(policy['enabled'] and kind in policy['allowed_kinds'])
 
     def set_group(self, group, enabled):
         names = {1: 'gateway_1', 2: 'gateway_2', 3: 'gateway_4'}
@@ -336,7 +361,7 @@ class _lgdt_CoreIngress:
         while not self.closed.is_set():
             try:
                 if not restored:
-                    self.inbox.restore(self.publish_json)
+                    self.inbox.restore(self.publish_json, self.business_allowed)
                     restored = True
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -418,7 +443,11 @@ class _lgdt_CoreIngress:
                     raise ValueError('JSON identity differs from VPN peer')
                 if payload.get('type') == 'transport_probe':
                     self.count(gateway, 'probes')
-                    reply = {'type': 'transport_probe_ack', 'version': _lgdt_VERSION, 'nonce': payload.get('nonce'), 'enabled': self.inbox.enabled(gateway), 'core_ready': True}
+                    policy = self.policy(gateway)
+                    reply = {'type': 'transport_probe_ack', 'version': _lgdt_VERSION,
+                             'nonce': payload.get('nonce'), 'core_ready': True,
+                             'gateway': gateway, 'capabilities': ['scene_policy_v1']}
+                    reply.update(policy)
                     conn.sendall(_lgdt_json_bytes(reply) + b'\n')
                     return
                 metadata = payload.pop('_transport', None)
@@ -427,8 +456,8 @@ class _lgdt_CoreIngress:
                 delivery_id = metadata.get('delivery_id')
                 if not isinstance(delivery_id, str) or not re.match('^[a-zA-Z0-9_-]{1,96}$', delivery_id):
                     raise ValueError('invalid delivery ID')
-                if not self.inbox.enabled(gateway):
-                    conn.sendall(_lgdt_json_bytes({'type': 'transport_ack', 'delivery_id': delivery_id, 'status': 'rejected', 'reason': 'disabled'}) + b'\n')
+                if not self.business_allowed(gateway, 'JSON'):
+                    conn.sendall(_lgdt_json_bytes({'type': 'transport_ack', 'delivery_id': delivery_id, 'status': 'rejected', 'reason': self.policy(gateway)['policy_reason']}) + b'\n')
                     continue
                 status = self.inbox.accept(gateway, delivery_id, payload, self.publish_json)
                 self.count(gateway, 'duplicates' if status == 'duplicate' else 'json_received')
@@ -441,10 +470,15 @@ class _lgdt_CoreIngress:
             buffer.extend(data)
 
     def media(self, conn, gateway):
+        if not any(self.business_allowed(gateway, kind) for kind in ('VID0', 'SNAP')):
+            raise ValueError('media rejected: ' + self.policy(gateway)['policy_reason'])
         while True:
             kind, length = struct.unpack('!4sQ', _lgdt_exact(conn, 12))
             if kind not in (b'VID0', b'SNAP') or length < 4 or length > _lgdt_MAX_MEDIA:
                 raise ValueError('invalid media frame')
+            kind_text = kind.decode()
+            if not self.business_allowed(gateway, kind_text):
+                raise ValueError('media kind rejected: ' + self.policy(gateway)['policy_reason'])
             body = _lgdt_exact(conn, length)
             size = struct.unpack('!I', body[:4])[0]
             if size > 1024 * 1024 or 4 + size > length:
@@ -457,12 +491,10 @@ class _lgdt_CoreIngress:
             jpeg = body[4 + size:]
             if not jpeg.startswith(b'\xff\xd8') or not jpeg.endswith(b'\xff\xd9'):
                 raise ValueError('invalid JPEG')
-            if not self.inbox.enabled(gateway):
-                continue
             with self.lock:
                 self.sequence[gateway] += 1
                 seq = self.sequence[gateway]
-            self.publish_media(gateway, kind.decode(), metadata, jpeg, seq)
+            self.publish_media(gateway, kind_text, metadata, jpeg, seq)
             self.count(gateway, 'media_received')
 CoreIngress = _lgdt_CoreIngress
 Inbox = _lgdt_Inbox
@@ -3380,8 +3412,8 @@ def main():
         )
 
     if TUNNEL_ENABLED:
-        json_routes = {"gateway_1":11406,"gateway_2":11407,"gateway_4":11408,"gateway_5":11409}
-        frame_routes = {"gateway_{}".format(i):11400+i-1 for i in range(1,7)}
+        json_routes = dict(TUNNEL_JSON_ROUTES)
+        frame_routes = dict(TUNNEL_FRAME_ROUTES)
         direct_fps = {}
         def direct_json(gateway, payload):
             port = json_routes.get(gateway)
@@ -3402,7 +3434,8 @@ def main():
                 else:
                     direct_fps[gateway] = (last,count)
         _TUNNEL_INGRESS = CoreIngress(TUNNEL_LISTEN_HOST,TUNNEL_LISTEN_PORT,TUNNEL_PEERS,
-                                      Inbox(TUNNEL_INBOX_PATH),direct_json,direct_media,log=log)
+                                      Inbox(TUNNEL_INBOX_PATH),direct_json,direct_media,
+                                      scenes=TUNNEL_SCENES,log=log)
         _TUNNEL_INGRESS.start()
 
     # ----- 启动前端 HTTP 服务（视频、快照、非卫星JSON） -----
@@ -3492,6 +3525,15 @@ def main():
 
     # ----- 上游拉取线程（旧协议 + 非卫星JSON） -----
     for server_port in FRAMED_SERVER_INPUT_PORTS:
+        media_owned_by_tunnel = any(
+            TUNNEL_SOURCE_OWNER.get((server_port, kind)) == "tunnel"
+            for kind in ("VID0", "SNAP")
+        )
+        if TUNNEL_ENABLED and media_owned_by_tunnel:
+            log("[UPSTREAM][{}] legacy pull disabled; source owner=tunnel".format(
+                CHANNEL_NAME.get(server_port, server_port)
+            ))
+            continue
         t = threading.Thread(
             target=server_framed_pull_loop,
             args=(
@@ -3505,6 +3547,11 @@ def main():
         t.start()
 
     for server_port in JSON_SERVER_INPUT_PORTS:  # 注意：11410 已不在列表中
+        if TUNNEL_ENABLED and TUNNEL_SOURCE_OWNER.get((server_port, "JSON")) == "tunnel":
+            log("[JSON-UP][{}] legacy pull disabled; source owner=tunnel".format(
+                CHANNEL_NAME.get(server_port, server_port)
+            ))
+            continue
         t = threading.Thread(
             target=server_json_pull_loop,
             args=(

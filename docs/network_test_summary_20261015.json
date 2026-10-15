@@ -1,0 +1,75 @@
+{
+  "verified_at": "2026-10-15 13:32:25",
+  "wiring": {
+    "COM5": "GW1",
+    "COM8": "GW2",
+    "LAN": "core 192.168.0.233 / PC 192.168.0.100"
+  },
+  "edges": {
+    "1": {
+      "sha256": "ff44526aaf16f3a0e072fe0e631acd5d91b8b312663f023923db48d1db17ae06",
+      "probe_rtt_ms": 533.58,
+      "pending": 0,
+      "time_set": {
+        "marker": "final-networktest-ea592a3e31104f1f9aebfbb7b27bcd42",
+        "time_set": {
+          "cmd": "time_set",
+          "val": "2026-10-15 13:31:02"
+        },
+        "timezone": "Asia/Shanghai",
+        "difference_seconds": 0.311008,
+        "verified": true
+      },
+      "business_restart_seconds": 5.28,
+      "carrier_recovery_seconds": 3.86
+    },
+    "2": {
+      "sha256": "ff44526aaf16f3a0e072fe0e631acd5d91b8b312663f023923db48d1db17ae06",
+      "probe_rtt_ms": 404.36,
+      "pending": 0,
+      "time_set": {
+        "marker": "final-networktest-2922a0818b1148d3ac83cf9096afcb56",
+        "time_set": {
+          "cmd": "time_set",
+          "val": "2026-10-15 13:31:02"
+        },
+        "timezone": "Asia/Shanghai",
+        "difference_seconds": 0.234727,
+        "verified": true
+      },
+      "business_restart_seconds": 5.3,
+      "carrier_recovery_seconds": 3.82
+    }
+  },
+  "assertions": {
+    "identity_mapping": true,
+    "matching_deployed_code": true,
+    "json_and_dedup": true,
+    "identity_rejection": true,
+    "video_hashes": true,
+    "gw1_snapshot_hash": true,
+    "dual_12_frame_transfer": true,
+    "local_json_media_ingress": true,
+    "time_set_beijing": true,
+    "whitelist_pass_and_block": true,
+    "sse_push": true,
+    "group_stop_and_recover": true,
+    "business_crash_recovery": true,
+    "carrier_recovery": true,
+    "outbox_persists_and_drains": true,
+    "core_business_restart": true,
+    "server_business_pause_independent": true,
+    "final_pending_zero": true,
+    "final_lan_json_read": true
+  },
+  "actual_lan_socket": {
+    "source": [
+      "192.168.0.100",
+      49678
+    ],
+    "target": [
+      "192.168.0.233",
+      10015
+    ]
+  }
+}
