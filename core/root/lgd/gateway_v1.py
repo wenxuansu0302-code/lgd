@@ -277,6 +277,78 @@ class _lgdt_Inbox(_lgdt_Database):
             row = db.execute('SELECT enabled FROM policy WHERE gateway=?', (gateway,)).fetchone()
             return bool(row['enabled']) if row else True
 
+class ReceiveMetrics:
+    """Count unique accepted business payloads, never encrypted carrier bytes."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.process_id = uuid.uuid4().hex
+        self.since = time.time()
+        self.totals = {}
+        self.buckets = {}
+
+    @staticmethod
+    def json_slice(payload):
+        keys = {str(key).strip().lower() for key in payload}
+        kind = str(payload.get('type') or payload.get('data_type') or payload.get('business_type') or '').lower().strip()
+        return 'urllc' if keys.intersection({'fire', 'alarm', 'alert', 'warning', 'control', 'command', 'cmd', 'callee_id', 'reset'}) or kind in {'fire', 'alarm', 'alert', 'warning', 'control', 'command', 'cmd', 'emergency'} else 'mmtc'
+
+    def record(self, gateway, slice_id, size, kind):
+        now = time.time()
+        with self.lock:
+            totals = self.totals.setdefault(gateway, {})
+            value = totals.setdefault(slice_id, {'bytes': 0, 'packets': 0, 'json': 0,
+                'video': 0, 'snapshot': 0, 'last_received_at': None})
+            value['bytes'] += size
+            value['packets'] += 1
+            value[kind] += 1
+            value['last_received_at'] = now
+            bucket = self.buckets.setdefault(gateway, {}).setdefault(int(now), {})
+            counts = bucket.setdefault(slice_id, collections.Counter())
+            counts['bytes'] += size
+            counts['packets'] += 1
+            counts[kind] += 1
+            buckets = self.buckets[gateway]
+            if len(buckets) > 65:
+                for second in list(buckets):
+                    if second < int(now) - 60:
+                        del buckets[second]
+
+    def snapshot(self, gateway):
+        now = time.time()
+        second = int(now)
+        with self.lock:
+            buckets = self.buckets.setdefault(gateway, {})
+            for key in list(buckets):
+                if key < second - 60:
+                    del buckets[key]
+            totals = copy.deepcopy(self.totals.get(gateway, {}))
+            buckets = copy.deepcopy(buckets)
+        slices = {}
+        for name in ('embb', 'mmtc', 'urllc'):
+            value = totals.get(name, {'bytes': 0, 'packets': 0, 'json': 0,
+                'video': 0, 'snapshot': 0, 'last_received_at': None})
+            last = buckets.get(second - 1, {}).get(name, {})
+            slices[name] = dict(value, received_bps=last.get('bytes', 0) * 8,
+                received_pps=last.get('packets', 0), video_fps=last.get('video', 0))
+        history = []
+        for key in range(max(int(self.since) + 1, second - 60), second):
+            bucket = buckets.get(key, {})
+            history.append({'timestamp': key, 'received_bps': sum(v.get('bytes', 0) * 8 for v in bucket.values()),
+                'slices_bps': {name: bucket.get(name, {}).get('bytes', 0) * 8 for name in slices}})
+        return {'process_id': self.process_id, 'since': self.since, 'sampled_at': now,
+            'rate_window_ms': 1000, 'rate_interval_end': second,
+            'rate_ready': second - 1 > int(self.since),
+            'byte_scope': 'accepted_json_utf8_and_jpeg_payload_excludes_duplicates',
+            'bytes': sum(v['bytes'] for v in slices.values()),
+            'json': sum(v['json'] for v in slices.values()),
+            'video': sum(v['video'] for v in slices.values()),
+            'snapshot': sum(v['snapshot'] for v in slices.values()),
+            'received_bps': sum(v['received_bps'] for v in slices.values()),
+            'last_received_at': max((v['last_received_at'] or 0 for v in slices.values())) or None,
+            'slices': slices, 'history': history}
+
+
 class _lgdt_CoreIngress:
 
     def __init__(self, host, port, peers, inbox, publish_json, publish_media, scenes=None, log=print):
@@ -294,6 +366,7 @@ class _lgdt_CoreIngress:
         self.active = set()
         self.sequence = collections.Counter()
         self.monitor = _lgdt_NebulaMonitor(self.peers)
+        self.received_metrics = ReceiveMetrics()
 
     def snapshot(self, gateway=None):
         with self.lock:
@@ -302,6 +375,7 @@ class _lgdt_CoreIngress:
             value = values.setdefault(name, dict({'json_received': 0, 'media_received': 0}, **self.policy(name)))
             value.update(self.monitor.snapshot(ip))
             value['virtual_peer'] = ip
+            value['received'] = self.received_metrics.snapshot(name)
         if gateway:
             name = _lgdt_canonical(gateway)
             return values.get(name, dict({'json_received': 0, 'media_received': 0}, **self.policy(name)))
@@ -460,6 +534,9 @@ class _lgdt_CoreIngress:
                     conn.sendall(_lgdt_json_bytes({'type': 'transport_ack', 'delivery_id': delivery_id, 'status': 'rejected', 'reason': self.policy(gateway)['policy_reason']}) + b'\n')
                     continue
                 status = self.inbox.accept(gateway, delivery_id, payload, self.publish_json)
+                if status == 'accepted':
+                    self.received_metrics.record(gateway, ReceiveMetrics.json_slice(payload),
+                                                 len(_lgdt_json_bytes(payload)), 'json')
                 self.count(gateway, 'duplicates' if status == 'duplicate' else 'json_received')
                 conn.sendall(_lgdt_json_bytes({'type': 'transport_ack', 'delivery_id': delivery_id, 'status': status}) + b'\n')
             if len(buffer) > _lgdt_MAX_JSON:
@@ -495,6 +572,8 @@ class _lgdt_CoreIngress:
                 self.sequence[gateway] += 1
                 seq = self.sequence[gateway]
             self.publish_media(gateway, kind_text, metadata, jpeg, seq)
+            self.received_metrics.record(gateway, 'embb', len(jpeg),
+                                         'video' if kind_text == 'VID0' else 'snapshot')
             self.count(gateway, 'media_received')
 CoreIngress = _lgdt_CoreIngress
 Inbox = _lgdt_Inbox
@@ -1201,12 +1280,13 @@ def make_json_handler(json_hub):
                     self.client_address
                 ))
 
+                # Establish the cursor before telling the client it is ready;
+                # otherwise its first update can race the cursor assignment.
+                last_seq = json_hub.current_seq()
                 self.wfile.write(b": connected\n\n")
                 self.wfile.flush()
 
                 # Do not push old JSON when frontend reconnects.
-                last_seq = json_hub.current_seq()
-
                 while True:
                     item = json_hub.wait_next(last_seq, timeout=15.0)
 
@@ -3046,6 +3126,113 @@ class SliceMetricsRegistry:
         self._lock = threading.Lock()
         self._latest = {}
         self._sequence = 0
+        self.process_id = uuid.uuid4().hex
+        self.since = time.time()
+        self._events = deque(maxlen=96)
+        self._event_sequence = 0
+        self._states = {}
+        self._probe_history = {}
+
+    def sidebar(self, gateway, edge_status, payload, transport, shortwave):
+        now = time.time()
+        fresh = edge_status == 'online'
+        edge_transport = payload.get('transport') or {}
+        probe = edge_transport.get('probe_window') or {}
+        received = transport.get('received') or {}
+        last_probe = transport.get('last_probes')
+        reachable = bool(last_probe and 0 <= now - last_probe <= 6)
+        admitted = transport.get('enabled') is True
+        if fresh and edge_transport.get('business_allowed') is False:
+            admitted = False
+        mode = transport.get('business_mode')
+        if mode == 'standby':
+            state = 'standby'
+        elif not admitted:
+            state = 'disabled' if transport.get('policy_reason') == 'group_disabled' else 'unavailable'
+        else:
+            state = 'ready' if reachable else 'unavailable'
+        last_data = received.get('last_received_at')
+        active = bool(reachable and admitted and last_data and 0 <= now - last_data <= 3)
+        rates_ready = bool(received.get('rate_ready') and _TUNNEL_INGRESS is not None
+                           and _TUNNEL_INGRESS.listener_state == 'listening')
+        outbox = payload.get('outbox') or {}
+        satellite = copy.deepcopy(payload.get('satellite') or {'state': 'unknown', 'reason': 'not_reported'})
+        if not fresh:
+            satellite = {'state': 'unknown', 'reason': 'edge_telemetry_stale',
+                         'module_confirmed': None, 'ground_confirmed': None, 'pending_frames': None}
+        slices = {}
+        for name in ('embb', 'mmtc', 'urllc'):
+            sent = payload.get('slices', {}).get(name, {})
+            rx = received.get('slices', {}).get(name, {})
+            queue = sent.get('queue') or {}
+            slices[name] = {
+                'quality': 'fresh' if fresh and sent else 'stale' if sent else 'unavailable',
+                'selected_path': '5g_tunnel' if reachable and admitted else None,
+                'input_bps': sent.get('input_bps') if fresh else None,
+                'send_bps': sent.get('output_bps') if fresh else None,
+                'input_pps': sent.get('input_rate_pps') if fresh else None,
+                'send_pps': sent.get('output_rate_pps') if fresh else None,
+                'received_bps': rx.get('received_bps') if rates_ready else None,
+                'received_pps': rx.get('received_pps') if rates_ready else None,
+                'video_fps': rx.get('video_fps') if rates_ready and name == 'embb' else None,
+                'last_received_at': rx.get('last_received_at'),
+                'queue_depth': queue.get('depth') if fresh else None,
+                'queue_capacity': queue.get('capacity') if fresh else None,
+                'dropped_interval': queue.get('dropped_interval') if fresh else None,
+                'dropped_total': sent.get('totals', {}).get('drops') if fresh else None,
+                'processing_ms': sent.get('latency_ms') if fresh else None,
+                'latency_kind': sent.get('latency_kind'),
+                'delivery': copy.deepcopy(sent.get('delivery')) if fresh else None,
+                'pending': outbox.get('pending') if fresh and name == 'urllc' else None,
+                'oldest_wait_ms': outbox.get('oldest_wait_ms') if fresh and name == 'urllc' else None,
+                'end_to_end_frame_age_ms': None,
+            }
+        with self._lock:
+            observed = (state, edge_status, satellite.get('state'))
+            previous = self._states.get(gateway)
+            if previous is not None and previous != observed:
+                self._event_sequence += 1
+                self._events.append({'id': self.process_id + ':' + str(self._event_sequence),
+                    'gateway': gateway, 'timestamp': now, 'type': 'observed_state_change',
+                    'before': list(previous), 'after': list(observed)})
+            self._states[gateway] = observed
+            history = self._probe_history.setdefault(gateway, deque(maxlen=60))
+            sample = {'timestamp': int(now), 'probe_rtt_ms': edge_transport.get('rtt_ms') if fresh else None}
+            if history and history[-1]['timestamp'] == sample['timestamp']:
+                history[-1] = sample
+            else:
+                history.append(sample)
+            probe_history = [dict(p) for p in history if now - p['timestamp'] <= 60]
+            events = [dict(event) for event in self._events if event['gateway'] == gateway]
+        return {'schema_version': '1.1', 'sampled_at': now, 'process_id': self.process_id,
+            'edge_process_id': payload.get('telemetry', {}).get('process_id'),
+            'edge_sampled_at': payload.get('telemetry', {}).get('sampled_at'),
+            'edge_quality': 'fresh' if fresh else 'stale' if payload else 'unavailable',
+            'current_path': '5g_tunnel' if reachable and admitted else None,
+            'carrying_business': active,
+            'links': {
+                'tunnel': {'state': state, 'reachable': reachable, 'business_allowed': admitted,
+                    'probe_rtt_ms': edge_transport.get('rtt_ms') if fresh else None,
+                    'probe_success_pct': probe.get('success_pct') if fresh else None,
+                    'probe_attempts': probe.get('attempts') if fresh else None,
+                    'probe_successes': probe.get('successes') if fresh else None,
+                    'probe_window_ms': 60000, 'last_probe_success_at': last_probe,
+                    'throughput_bps': received.get('received_bps') if rates_ready else None,
+                    'received_bytes': received.get('bytes'), 'json_received': received.get('json'),
+                    'video_received': received.get('video'), 'snapshot_received': received.get('snapshot'),
+                    'since': received.get('since'), 'last_business_at': last_data},
+                'server_relay': {'state': 'not_deployed', 'throughput_bps': None, 'rtt_ms': None},
+                'shortwave': {'state': 'unverified' if shortwave.get('connected') else 'disconnected',
+                    'industrial_pc_connected': bool(shortwave.get('connected')),
+                    'active_for_gateway': shortwave.get('active_for_gateway', False),
+                    'hf_status': shortwave.get('hf_status'), 'detect': shortwave.get('detect'),
+                    'throughput_bps': None, 'success_pct': None},
+                'satellite': satellite},
+            'slices': slices, 'receive_history': received.get('history', []),
+            'probe_history': probe_history, 'events': events,
+            'unsupported': ['end_to_end_frame_age_ms', 'shortwave_throughput_bps',
+                            'shortwave_success_pct', 'satellite_ground_confirmation',
+                            'server_relay_failover']}
 
     def update(self, payload):
         if not isinstance(payload, dict) or payload.get("type") != "slice_metrics":
@@ -3112,6 +3299,9 @@ class SliceMetricsRegistry:
             age_seconds = (
                 now_mono - entry["received_monotonic"] if entry else None
             )
+            relay_at = payload.get('relay', {}).get('server_received_at')
+            if isinstance(relay_at, (int, float)) and age_seconds is not None:
+                age_seconds = max(age_seconds, max(0, time.time() - relay_at))
             edge_status = self._edge_status(age_seconds, entry is not None)
             heartbeat_group = SLICE_GATEWAY_HEARTBEAT_GROUP[canonical]
             mobile_online = self.heartbeat_status.is_online(heartbeat_group)
@@ -3148,6 +3338,9 @@ class SliceMetricsRegistry:
                 )
 
             source_gateway = payload.get("gateway", canonical)
+            transport = _TUNNEL_INGRESS.snapshot(source_gateway) if _TUNNEL_INGRESS else {'enabled': False}
+            shortwave_for_gateway = dict(shortwave, active_for_gateway=active_for_gateway)
+            sidebar = self.sidebar(canonical, edge_status, payload, transport, shortwave_for_gateway)
             gateways.append({
                 # gateway keeps the declaration originating from edge --gateway.
                 "gateway": source_gateway,
@@ -3180,14 +3373,19 @@ class SliceMetricsRegistry:
                     },
                 },
                 "slices": slices,
-                "transport": (_TUNNEL_INGRESS.snapshot(source_gateway) if _TUNNEL_INGRESS else {"enabled": False}),
+                "transport": transport,
+                "edge_transport": copy.deepcopy(payload.get('transport')),
+                "edge_telemetry": copy.deepcopy(payload.get('telemetry')),
+                "sidebar": sidebar,
             })
 
         return {
             "type": "multi_gateway_slice_status",
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "sequence": sequence,
             "timestamp": datetime.now(BJ_TZ).isoformat(timespec="milliseconds"),
+            "process_id": self.process_id,
+            "expires_after_ms": 5000,
             "gateways": gateways,
         }
 

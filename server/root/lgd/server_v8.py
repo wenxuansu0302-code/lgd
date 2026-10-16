@@ -165,6 +165,7 @@ _DOWNSTREAM = DownstreamConnections()
 _POLICY_PATH = "/root/lgd/tunnel_group_policy.json"
 _POLICY_WRITE_LOCK = threading.Lock()
 TUNNEL_POLICY_VERSION = 1
+_SLICE_METRICS_HUB = None
 TUNNEL_SCENE_MODES = {
     "gateway_1": "active",
     "gateway_2": "active",
@@ -905,7 +906,9 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split('?')[0]
-        if path.startswith('/stop'):
+        if path == '/telemetry':
+            self._send_response(200, _SLICE_METRICS_HUB.snapshot() if _SLICE_METRICS_HUB else {'state': 'starting'})
+        elif path.startswith('/stop'):
             try:
                 group = int(path[5:])
                 if group not in (1,2,3):
@@ -2253,16 +2256,33 @@ class LatestSliceStateHub:
         self._latest = {}
         self._history = deque(maxlen=max(16, int(history_size)))
         self._version = 0
+        self.process_id = uuid.uuid4().hex
+        self.started_at = time.time()
+        self._received_at = {}
 
     def update(self, gateway_id, payload):
-        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         with self._condition:
+            forwarded = dict(payload)
+            received_at = time.time()
+            forwarded['relay'] = {'server_received_at': received_at,
+                                  'server_process_id': self.process_id}
+            encoded = json.dumps(forwarded, ensure_ascii=False, separators=(",", ":"))
             self._version += 1
             version = self._version
             self._latest[gateway_id] = encoded
+            self._received_at[gateway_id] = received_at
             self._history.append((version, encoded))
             self._condition.notify_all()
             return version
+
+    def snapshot(self):
+        with self._condition:
+            return {'state': 'running', 'schema_version': '1.1', 'sampled_at': time.time(),
+                'process_id': self.process_id, 'since': self.started_at,
+                'reports_received': self._version,
+                'gateways': {name: {'last_received_at': stamp,
+                    'age_ms': round(max(0, time.time() - stamp) * 1000, 2)}
+                    for name, stamp in self._received_at.items()}}
 
     def initial(self):
         with self._condition:
@@ -2464,6 +2484,7 @@ def start_edge_heartbeat_server(host, port, registry, max_line_size):
 
 # ======================== Main ========================
 def main():
+    global _SLICE_METRICS_HUB
     global gateway4_fire_queue, _CORE_VPN_HOST
 
     parser = argparse.ArgumentParser(
@@ -2531,6 +2552,7 @@ def main():
         args.link_status_port,
     )
     slice_hub = LatestSliceStateHub()
+    _SLICE_METRICS_HUB = slice_hub
 
     storage = ImageStorage(args.storage, args.max_files)
 

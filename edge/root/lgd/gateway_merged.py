@@ -241,6 +241,12 @@ class _lgdt_Outbox(_lgdt_Database):
         with self.lock, self.connect() as db:
             return db.execute('SELECT count(*) FROM outbox').fetchone()[0]
 
+    def snapshot(self):
+        with self.lock, self.connect() as db:
+            row = db.execute('SELECT count(*) AS pending, min(created) AS oldest FROM outbox').fetchone()
+        return {'pending': row['pending'], 'oldest_wait_ms':
+                round(max(0, time.time() - row['oldest']) * 1000, 2) if row['oldest'] is not None else None}
+
 class _lgdt_DurableQueue:
     """Keep critical messages before admission to the original dropping queue."""
 
@@ -328,6 +334,11 @@ class _lgdt_PathManager:
         self.state = {'vpn_backend': 'nebula', 'security_mode': 'strict_e2e', 'virtual_peer': host, 'application_target': '{}:{}'.format(host, port), 'overlay_mode': 'unknown', 'core_probe': 'starting', 'business_mode': business_mode, 'business_allowed': False, 'allowed': False, 'allowed_kinds': [], 'policy_version': None, 'route_reason': 'not yet probed', 'last_change': time.time(), 'failures': 0, 'rtt_ms': None}
         self.closed = threading.Event()
         self.monitor = _lgdt_NebulaMonitor([host])
+        self.probe_samples = collections.deque(maxlen=512)
+
+    def record_probe(self, success, rtt_ms=None):
+        with self.lock:
+            self.probe_samples.append((time.time(), bool(success), rtt_ms))
 
     def start(self):
         self.monitor.start()
@@ -336,6 +347,14 @@ class _lgdt_PathManager:
     def snapshot(self):
         with self.lock:
             value = dict(self.state)
+            samples = [s for s in self.probe_samples if time.time() - s[0] <= 60]
+            successful = [s for s in samples if s[1]]
+            value['probe_window'] = {
+                'window_ms': 60000, 'attempts': len(samples), 'successes': len(successful),
+                'success_pct': round(len(successful) * 100.0 / len(samples), 2) if samples else None,
+                'last_attempt_at': samples[-1][0] if samples else None,
+                'last_success_at': successful[-1][0] if successful else None,
+            }
         value.update(self.monitor.snapshot(self.host))
         return value
 
@@ -388,7 +407,9 @@ class _lgdt_PathManager:
                                       route_reason=reason or ('core ingress ready' if enabled else 'administratively disabled'))
                     if changed:
                         self.state['last_change'] = time.time()
+                self.record_probe(True, round((time.monotonic() - start) * 1000, 2))
             except (OSError, ValueError, ConnectionError) as exc:
+                self.record_probe(False)
                 self.record_failure(exc)
             self.closed.wait(self.interval)
 
@@ -404,6 +425,21 @@ class _lgdt_TunnelJsonSender:
             self.conn = None
 
     def _send(self, wire, delivery_id):
+        slice_id = classify_json_slice(json.loads(wire))
+        if self.metrics:
+            self.metrics.record_delivery_attempt(slice_id, delivery_id)
+        started = time.monotonic()
+        try:
+            ack = self._send_once(wire, delivery_id)
+        except (OSError, ValueError, ConnectionError):
+            if self.metrics:
+                self.metrics.record_delivery_result(slice_id, False)
+            raise
+        if self.metrics:
+            self.metrics.record_delivery_result(slice_id, True, (time.monotonic() - started) * 1000)
+        return ack
+
+    def _send_once(self, wire, delivery_id):
         self.path.require()
         if self.conn is None:
             self.conn = socket.create_connection((self.path.host, self.path.port), timeout=5)
@@ -414,6 +450,7 @@ class _lgdt_TunnelJsonSender:
             raise ValueError('invalid delivery ACK')
         if ack.get('status') not in ('accepted', 'duplicate'):
             raise ConnectionError('core rejected delivery: ' + str(ack.get('reason', 'unknown')))
+        return ack
 
     def run_forever(self):
         current = None
@@ -825,18 +862,53 @@ class SliceMetricsCollector:
                       "out_bytes": 0, "latency_ms_total": 0.0,
                       "latency_samples": 0, "drops": 0},
         }
+        self.process_id = uuid.uuid4().hex
+        self.started_at = time.time()
+        self._totals = {name: dict(values) for name, values in self._counters.items()}
+        self._delivery = {name: {'attempts': 0, 'confirmed': 0, 'failed': 0,
+                                'retries': 0, 'ack_ms_total': 0.0}
+                          for name in self._counters}
+        self._delivery_ids = collections.OrderedDict()
+        self._last_input = {}
+        self._last_output = {}
+        self.business_source = None
+        self.satellite_enabled = None
+
+    def record_delivery_attempt(self, slice_id, delivery_id):
+        with self._lock:
+            item = self._delivery[slice_id]
+            item['attempts'] += 1
+            if delivery_id in self._delivery_ids:
+                item['retries'] += 1
+                self._delivery_ids.move_to_end(delivery_id)
+            self._delivery_ids[delivery_id] = True
+            if len(self._delivery_ids) > 8192:
+                self._delivery_ids.popitem(last=False)
+
+    def record_delivery_result(self, slice_id, confirmed, ack_ms=None):
+        with self._lock:
+            item = self._delivery[slice_id]
+            item['confirmed' if confirmed else 'failed'] += 1
+            if confirmed:
+                item['ack_ms_total'] += max(0.0, float(ack_ms or 0))
 
     def record_input(self, slice_id, size_bytes):
         with self._lock:
             item = self._counters[slice_id]
             item["in_packets"] += 1
             item["in_bytes"] += max(0, int(size_bytes))
+            self._totals[slice_id]['in_packets'] += 1
+            self._totals[slice_id]['in_bytes'] += max(0, int(size_bytes))
+            self._last_input[slice_id] = time.time()
 
     def record_output(self, slice_id, size_bytes, latency_ms=None):
         with self._lock:
             item = self._counters[slice_id]
             item["out_packets"] += 1
             item["out_bytes"] += max(0, int(size_bytes))
+            self._totals[slice_id]['out_packets'] += 1
+            self._totals[slice_id]['out_bytes'] += max(0, int(size_bytes))
+            self._last_output[slice_id] = time.time()
             if latency_ms is not None:
                 item["latency_ms_total"] += max(0.0, float(latency_ms))
                 item["latency_samples"] += 1
@@ -849,6 +921,7 @@ class SliceMetricsCollector:
             slice_id = default_slice
         with self._lock:
             self._counters[slice_id]["drops"] += 1
+            self._totals[slice_id]['drops'] += 1
 
     @staticmethod
     def _queue_state(depth, capacity):
@@ -859,7 +932,21 @@ class SliceMetricsCollector:
         result = self._snapshot_without_transport()
         if _TUNNEL_PATH is not None:
             result["transport"] = _TUNNEL_PATH.snapshot()
-            result["transport"]["critical_pending"] = _TUNNEL_OUTBOX.count()
+            if _TUNNEL_OUTBOX is not None:
+                try:
+                    result['outbox'] = _TUNNEL_OUTBOX.snapshot()
+                except (sqlite3.Error, OSError) as exc:
+                    result['outbox'] = {'pending': None, 'oldest_wait_ms': None,
+                                        'quality': 'unavailable', 'error': str(exc)}
+                result["transport"]["critical_pending"] = result['outbox']['pending']
+        satellite = getattr(self.business_source, 'satellite_uplink', None)
+        result['satellite'] = satellite.snapshot() if satellite is not None else {
+            'state': 'disabled' if self.satellite_enabled is False else 'unknown',
+            'sampled_at': time.time(), 'module_confirmed': None,
+            'ground_confirmed': None, 'pending_frames': None,
+            'reason': 'disabled_by_configuration' if self.satellite_enabled is False else 'not_reported'}
+        result['telemetry'] = {'process_id': self.process_id, 'since': self.started_at,
+                               'sampled_at': time.time(), 'schema_version': '1.1'}
         return result
 
     def _snapshot_without_transport(self):
@@ -870,6 +957,9 @@ class SliceMetricsCollector:
             self._sequence += 1
             sequence = self._sequence
             counters = self._counters
+            totals = {name: dict(value) for name, value in self._totals.items()}
+            deliveries = {name: dict(value) for name, value in self._delivery.items()}
+            last_input, last_output = dict(self._last_input), dict(self._last_output)
             self._counters = {
                 name: {key: 0.0 if key == "latency_ms_total" else 0
                        for key in values}
@@ -889,6 +979,16 @@ class SliceMetricsCollector:
             samples = item["latency_samples"]
             state = self._queue_state(depth, capacity)
             return {
+                'totals': totals[slice_id],
+                'last_input_at': last_input.get(slice_id),
+                'last_output_at': last_output.get(slice_id),
+                'delivery': dict(deliveries[slice_id],
+                    ack_success_pct=round(deliveries[slice_id]['confirmed'] * 100.0 /
+                        (deliveries[slice_id]['confirmed'] + deliveries[slice_id]['failed']), 2)
+                        if deliveries[slice_id]['confirmed'] + deliveries[slice_id]['failed'] else None,
+                    ack_mean_ms=round(deliveries[slice_id]['ack_ms_total'] /
+                        deliveries[slice_id]['confirmed'], 2) if deliveries[slice_id]['confirmed'] else None),
+                'latency_kind': 'queue_and_socket_send' if slice_id == 'embb' or not TUNNEL_ENABLED else 'send_to_core_ack',
                 "input_rate_pps": round(item["in_packets"] / interval, 2),
                 "output_rate_pps": round(item["out_packets"] / interval, 2),
                 "input_bps": round(item["in_bytes"] * 8.0 / interval, 2),
@@ -3937,6 +4037,23 @@ class SatelliteUplink(threading.Thread):
         self._monitor_ser = None
         self.serial_module = None
         self.list_ports_module = None
+        self._telemetry_lock = threading.Lock()
+        self._telemetry = {'state': 'starting', 'last_error': None,
+                           'attempts': 0, 'module_confirmed': 0, 'failed': 0,
+                           'confirmed_bytes': 0, 'last_module_confirmed_at': None,
+                           'pending_frames': None, 'pending_sampled_at': None,
+                           'ground_confirmed': None}
+
+    def snapshot(self):
+        with self._telemetry_lock:
+            result = dict(self._telemetry)
+        result['sampled_at'] = time.time()
+        result['confirmation_scope'] = 'satellite_module_only'
+        return result
+
+    def _update_telemetry(self, **fields):
+        with self._telemetry_lock:
+            self._telemetry.update(fields)
 
     # ------------------------------------------------------------------
     # 业务报文构造（规范 4 节）
@@ -4243,6 +4360,7 @@ class SatelliteUplink(threading.Thread):
     def _query_pending_count(self, ser):
         ok, lines = self._send_at_command(ser, "AT+CMMQ?\r\n")
         if not ok:
+            self._update_telemetry(pending_frames=None, pending_sampled_at=time.time())
             log(
                 "[SATELLITE][WARN] pending queue query failed responses={}".format(
                     lines
@@ -4254,12 +4372,14 @@ class SatelliteUplink(threading.Thread):
             match = SATELLITE_CMMQ_RE.match(line)
             if match:
                 count = int(match.group(1))
+                self._update_telemetry(pending_frames=count, pending_sampled_at=time.time())
                 log("[SATELLITE] pending_frames={}".format(count))
                 return count
         log(
             "[SATELLITE][WARN] pending count not found responses={}".format(lines),
             level="WARN",
         )
+        self._update_telemetry(pending_frames=None, pending_sampled_at=time.time())
         return None
 
     def _send_business_frame(self, ser, reason, snapshot=None):
@@ -4287,17 +4407,26 @@ class SatelliteUplink(threading.Thread):
             )
         )
         detail_log("[SATELLITE][SEND] payload_hex={}".format(raw.hex().upper()))
-
+        with self._telemetry_lock:
+            self._telemetry['attempts'] += 1
         ok, lines = self._send_at_command(
             ser, command, timeout=max(self.command_timeout, 5.0)
         )
         if not ok:
+            with self._telemetry_lock:
+                self._telemetry['failed'] += 1
+                self._telemetry['last_error'] = 'module_send_not_confirmed'
             log(
                 "[SATELLITE][SEND][ERROR] AT+SEND failed responses={}".format(lines),
                 level="ERROR",
             )
             return False
 
+        with self._telemetry_lock:
+            self._telemetry['module_confirmed'] += 1
+            self._telemetry['confirmed_bytes'] += len(raw)
+            self._telemetry['last_module_confirmed_at'] = time.time()
+            self._telemetry['last_error'] = None
         if payload.get("s") == "F":
             self._last_sent_fire = bool(payload.get("v"))
 
@@ -4386,6 +4515,7 @@ class SatelliteUplink(threading.Thread):
 
     def run(self):
         if not self._load_pyserial():
+            self._update_telemetry(state='unavailable', last_error='pyserial_unavailable')
             return
         log(
             "[SATELLITE][MAIN] uplink started configured_port={} baud={} "
@@ -4419,6 +4549,7 @@ class SatelliteUplink(threading.Thread):
                 self._wake_and_initialize(ser)
                 # 会话就绪后交给巡检线程使用；断连时先摘除。
                 self._monitor_ser = ser
+                self._update_telemetry(state='ready', last_error=None)
                 send_index = 0
                 while True:
                     # 火情跳变检测：当前缓存火情与上次已上报值不同时先补一帧。
@@ -4494,6 +4625,8 @@ class SatelliteUplink(threading.Thread):
                     outcome = self._wait_for_next_cycle(ser)
                     detail_log("[SATELLITE] wake reason={}".format(outcome))
             except Exception as exc:
+                self._update_telemetry(state='unavailable', last_error=str(exc),
+                                       pending_frames=None)
                 log(
                     "[SATELLITE][ERROR] serial/uplink error={} reconnect_in={}s".format(
                         exc, self.reconnect_interval
@@ -4839,6 +4972,8 @@ def main():
         args.gateway,
         link_status_monitor,
     )
+    slice_metrics.business_source = baotong_server
+    slice_metrics.satellite_enabled = not args.disable_satellite
 
     json_sender = JsonCloudSender(
         args.cloud_host,
