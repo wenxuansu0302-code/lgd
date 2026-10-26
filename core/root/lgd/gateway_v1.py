@@ -3156,6 +3156,12 @@ class SliceMetricsRegistry:
         rates_ready = bool(received.get('rate_ready') and _TUNNEL_INGRESS is not None
                            and _TUNNEL_INGRESS.listener_state == 'listening')
         outbox = payload.get('outbox') or {}
+        # Older edge reports expose the durable outbox count only through
+        # transport.critical_pending. Keep accepting that schema so the
+        # sidebar can show a real zero instead of null.
+        outbox_pending = outbox.get('pending')
+        if outbox_pending is None:
+            outbox_pending = edge_transport.get('critical_pending')
         satellite = copy.deepcopy(payload.get('satellite') or {'state': 'unknown', 'reason': 'not_reported'})
         if not fresh:
             satellite = {'state': 'unknown', 'reason': 'edge_telemetry_stale',
@@ -3183,7 +3189,7 @@ class SliceMetricsRegistry:
                 'processing_ms': sent.get('latency_ms') if fresh else None,
                 'latency_kind': sent.get('latency_kind'),
                 'delivery': copy.deepcopy(sent.get('delivery')) if fresh else None,
-                'pending': outbox.get('pending') if fresh and name == 'urllc' else None,
+                'pending': outbox_pending if fresh and name == 'urllc' else None,
                 'oldest_wait_ms': outbox.get('oldest_wait_ms') if fresh and name == 'urllc' else None,
                 'end_to_end_frame_age_ms': None,
             }
