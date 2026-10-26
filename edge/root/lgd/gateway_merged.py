@@ -209,6 +209,7 @@ class _lgdt_Outbox(_lgdt_Database):
         with self.connect() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS outbox (delivery_id TEXT PRIMARY KEY, wire TEXT NOT NULL, slice_id TEXT NOT NULL, created REAL NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS outbox_state (key TEXT PRIMARY KEY, value REAL NOT NULL)')
 
     def add(self, item, gateway):
         payload = json.loads(item['json_data'])
@@ -231,6 +232,11 @@ class _lgdt_Outbox(_lgdt_Database):
 
     def ack(self, delivery_id):
         with self.lock, self.connect() as db:
+            row = db.execute('SELECT created FROM outbox WHERE delivery_id=?', (delivery_id,)).fetchone()
+            if row is not None:
+                wait_ms = max(0.0, (time.time() - row['created']) * 1000.0)
+                db.execute('INSERT INTO outbox_state(key,value) VALUES (\'last_confirmed_wait_ms\',?) '
+                           'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (wait_ms,))
             db.execute('DELETE FROM outbox WHERE delivery_id=?', (delivery_id,))
 
     def contains(self, delivery_id):
@@ -244,8 +250,16 @@ class _lgdt_Outbox(_lgdt_Database):
     def snapshot(self):
         with self.lock, self.connect() as db:
             row = db.execute('SELECT count(*) AS pending, min(created) AS oldest FROM outbox').fetchone()
-        return {'pending': row['pending'], 'oldest_wait_ms':
-                round(max(0, time.time() - row['oldest']) * 1000, 2) if row['oldest'] is not None else None}
+            saved = db.execute('SELECT value FROM outbox_state WHERE key=?',
+                               ('last_confirmed_wait_ms',)).fetchone()
+        current_wait = (round(max(0, time.time() - row['oldest']) * 1000, 2)
+                        if row['oldest'] is not None else None)
+        last_confirmed = round(saved['value'], 2) if saved is not None else None
+        return {'pending': row['pending'],
+                # Keep the previous completed duration visible when the queue drains.
+                'oldest_wait_ms': current_wait if current_wait is not None else last_confirmed,
+                'current_oldest_wait_ms': current_wait,
+                'last_confirmed_wait_ms': last_confirmed}
 
 class _lgdt_DurableQueue:
     """Keep critical messages before admission to the original dropping queue."""
@@ -939,6 +953,12 @@ class SliceMetricsCollector:
                     result['outbox'] = {'pending': None, 'oldest_wait_ms': None,
                                         'quality': 'unavailable', 'error': str(exc)}
                 result["transport"]["critical_pending"] = result['outbox']['pending']
+            # Put the durable-queue metrics beside the URLLC metrics as well.
+            # Some relays/older core builds preserve slices and transport
+            # differently from arbitrary top-level fields.
+            result["transport"]["oldest_wait_ms"] = result['outbox'].get('oldest_wait_ms')
+            result.setdefault('slices', {}).setdefault('urllc', {})[
+                'oldest_wait_ms'] = result['outbox'].get('oldest_wait_ms')
         satellite = getattr(self.business_source, 'satellite_uplink', None)
         result['satellite'] = satellite.snapshot() if satellite is not None else {
             'state': 'disabled' if self.satellite_enabled is False else 'unknown',

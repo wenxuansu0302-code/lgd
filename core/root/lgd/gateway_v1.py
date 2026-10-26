@@ -3190,7 +3190,13 @@ class SliceMetricsRegistry:
                 'latency_kind': sent.get('latency_kind'),
                 'delivery': copy.deepcopy(sent.get('delivery')) if fresh else None,
                 'pending': outbox_pending if fresh and name == 'urllc' else None,
-                'oldest_wait_ms': outbox.get('oldest_wait_ms') if fresh and name == 'urllc' else None,
+                'oldest_wait_ms': (
+                    outbox.get('oldest_wait_ms')
+                    if outbox.get('oldest_wait_ms') is not None
+                    else edge_transport.get('oldest_wait_ms')
+                    if edge_transport.get('oldest_wait_ms') is not None
+                    else sent.get('oldest_wait_ms')
+                ) if fresh and name == 'urllc' else None,
                 'end_to_end_frame_age_ms': None,
             }
         with self._lock:

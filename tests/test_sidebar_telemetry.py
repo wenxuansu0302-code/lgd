@@ -85,8 +85,13 @@ class TelemetryTests(unittest.TestCase):
             with outbox.connect() as connection:
                 connection.execute('UPDATE outbox SET created=?', (time.time() - 2,))
             self.assertGreater(outbox.snapshot()['oldest_wait_ms'], 1900)
+            self.assertGreater(outbox.snapshot()['current_oldest_wait_ms'], 1900)
             outbox.ack(record['delivery_id'])
-            self.assertEqual(outbox.snapshot(), {'pending': 0, 'oldest_wait_ms': None})
+            snapshot = outbox.snapshot()
+            self.assertEqual(snapshot['pending'], 0)
+            self.assertIsNone(snapshot['current_oldest_wait_ms'])
+            self.assertGreater(snapshot['oldest_wait_ms'], 1900)
+            self.assertEqual(snapshot['oldest_wait_ms'], snapshot['last_confirmed_wait_ms'])
 
     def test_outbox_telemetry_failure_does_not_kill_reporting(self):
         with tempfile.TemporaryDirectory() as temp:

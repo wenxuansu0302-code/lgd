@@ -135,7 +135,9 @@ HTTP/SSE 保留 `Access-Control-Allow-Origin: *`，前端可跨源读取。浏�
 | `latency_kind` | eMBB 为 queue_and_socket_send（排队到本地发送完成）；JSON 隧道为 send_to_core_ack（该次发送到核心 ACK）；不是端到端采集帧龄 |
 | `delivery` | JSON 发送尝试统计；eMBB 无此 ACK 协议，其零尝试与 null 成功率不能显示成视频确认成功 |
 | `pending` | 仅 URLLC：持久化 Outbox 未确认记录数；其他切片 null |
-| `oldest_wait_ms` | 仅 URLLC：最老未确认记录的等待毫秒；无积压 null |
+| `oldest_wait_ms` | 仅 URLLC：有积压时为当前最老未确认记录的等待毫秒；队列清空后保留最近一条已确认记录的等待毫秒（首次确认前为 null） |
+| `current_oldest_wait_ms` | 仅 URLLC：当前最老未确认记录的等待毫秒；无积压时为 null |
+| `last_confirmed_wait_ms` | 仅 URLLC：最近一条已确认记录从入队到确认的耗时；尚无确认记录时为 null |
 | `end_to_end_frame_age_ms` | null，未具备统一采集时钟与帧采集时间匹配 |
 
 `delivery` 内：
